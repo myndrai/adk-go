@@ -114,6 +114,36 @@ func TestGlobalInstruction_EmptyInstructionIsNoop(t *testing.T) {
 	}
 }
 
+// TestGlobalInstruction_DoesNotMutateCallerSlice locks down review fix #6:
+// the prepend must build a fresh Parts slice so the caller's existing
+// SystemInstruction.Parts backing array is left untouched. Other request
+// processors or downstream code may hold a reference to it.
+func TestGlobalInstruction_DoesNotMutateCallerSlice(t *testing.T) {
+	p, _ := builtin.GlobalInstruction(builtin.GlobalInstructionConfig{Instruction: "Be terse."})
+
+	originalParts := []*genai.Part{{Text: "Use English."}}
+	originalContent := &genai.Content{Parts: originalParts}
+	req := &model.LLMRequest{
+		Config: &genai.GenerateContentConfig{SystemInstruction: originalContent},
+	}
+	if _, err := p.BeforeModelCallback()(nil, req); err != nil {
+		t.Fatalf("BeforeModel: %v", err)
+	}
+
+	// Caller's original slice should still be a single element with the
+	// original text. The plugin must not have prepended into it.
+	if len(originalParts) != 1 {
+		t.Fatalf("originalParts mutated: len = %d, want 1", len(originalParts))
+	}
+	if originalParts[0].Text != "Use English." {
+		t.Errorf("originalParts[0].Text mutated: %q", originalParts[0].Text)
+	}
+	// Caller's original *Content should also be untouched.
+	if len(originalContent.Parts) != 1 {
+		t.Errorf("originalContent.Parts mutated: len = %d, want 1", len(originalContent.Parts))
+	}
+}
+
 func TestGlobalInstruction_DynamicProvider(t *testing.T) {
 	p, _ := builtin.GlobalInstruction(builtin.GlobalInstructionConfig{
 		InstructionFunc: func(agent.CallbackContext) (string, error) {
