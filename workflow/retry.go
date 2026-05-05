@@ -20,10 +20,18 @@ import (
 	"time"
 )
 
-// RetryConfig controls retry behavior around a node's RunImpl. Defaults
-// (used when a field is left at the zero value) match adk-python:
-// max_attempts=5, initial_delay=1s, max_delay=60s, backoff_factor=2.0,
-// jitter=1.0.
+// DefaultJitter is the recommended jitter window when callers want
+// non-deterministic backoff. Set Config.Jitter to this to opt in.
+const DefaultJitter = 0.5
+
+// RetryConfig controls retry behavior around a node's RunImpl. The zero
+// value means "no retry"; once MaxAttempts > 0 the other fields fall back
+// to documented defaults (initial_delay=1s, max_delay=60s, backoff=2.0).
+//
+// Jitter zero-value semantics differ from adk-python's RetryConfig (which
+// defaults to 1.0). v2 is a hard fork; the Go API picks zero-is-disabled
+// to match Go's zero-value intuition. Set Jitter = DefaultJitter to opt
+// into a 0.5 multiplicative window.
 type RetryConfig struct {
 	// MaxAttempts is the total attempt count, including the original call.
 	// 0 → default 5; 1 → no retries.
@@ -39,7 +47,12 @@ type RetryConfig struct {
 	BackoffFactor float64
 
 	// Jitter is the multiplicative jitter window applied to each delay,
-	// uniform in [1-jitter, 1+jitter]. 0 → default 1.0; <0 → no jitter.
+	// uniform in [1-jitter, 1+jitter]. The post-jitter delay is re-clamped
+	// to MaxDelay so jitter never lengthens the worst-case wait.
+	//
+	// Resolution rules:
+	//   0  → disabled — deterministic delays (the Go zero value)
+	//   >0 → use that value as the window (DefaultJitter is a typical choice)
 	Jitter float64
 
 	// Retryable, when non-nil, restricts retries to errors matching one of
@@ -62,9 +75,7 @@ func (r RetryConfig) withDefaults() RetryConfig {
 	if r.BackoffFactor <= 1 {
 		r.BackoffFactor = 2.0
 	}
-	if r.Jitter == 0 {
-		r.Jitter = 1.0
-	} else if r.Jitter < 0 {
+	if r.Jitter < 0 {
 		r.Jitter = 0
 	}
 	return r
@@ -82,6 +93,11 @@ func (r RetryConfig) DelayFor(attempt int) time.Duration {
 	if c.Jitter > 0 {
 		factor := 1 + (rand.Float64()*2-1)*c.Jitter
 		d = time.Duration(float64(d) * factor)
+	}
+	// Re-clamp post-jitter so the window can't push the delay above the
+	// configured ceiling.
+	if d > c.MaxDelay {
+		d = c.MaxDelay
 	}
 	if d < 0 {
 		d = 0
