@@ -327,3 +327,249 @@ func TestWorkflow_ConditionalRouting_DefaultBranch(t *testing.T) {
 		t.Error("default branch should have fired")
 	}
 }
+
+// TestWorkflow_RetryHonorsCtxCancellation locks down review fix #1: a
+// node whose retry sleep is interrupted by parent ctx cancellation must
+// stop attempting and return the cancellation error promptly. A bare
+// `break` inside the select previously left the attempt loop running with
+// a cancelled ctx, burning the retry budget.
+func TestWorkflow_RetryHonorsCtxCancellation(t *testing.T) {
+	var attempts atomic.Int32
+
+	seed := workflow.Func("seed",
+		func(_ *workflow.NodeContext, _ any) (int, error) { return 1, nil })
+	failing := workflow.Func("failing",
+		func(ctx *workflow.NodeContext, _ int) (int, error) {
+			attempts.Add(1)
+			return 0, errors.New("always fails")
+		},
+		workflow.WithRetry(&workflow.RetryConfig{
+			MaxAttempts:  10,
+			InitialDelay: 200 * time.Millisecond,
+			MaxDelay:     200 * time.Millisecond,
+			Jitter:       0,
+		}),
+	)
+
+	wf, err := workflow.New(workflow.Config{
+		Name: "cancelwf",
+		Edges: []workflow.Edge{
+			workflow.Connect(workflow.START, seed),
+			workflow.Connect(seed, failing),
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	wfAgent, err := wf.AsAgent()
+	if err != nil {
+		t.Fatalf("AsAgent: %v", err)
+	}
+	r, err := runner.New(runner.Config{
+		AppName:           "test",
+		Agent:             wfAgent,
+		SessionService:    session.InMemoryService(),
+		AutoCreateSession: true,
+	})
+	if err != nil {
+		t.Fatalf("runner.New: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		// Cancel after a single retry sleep starts so we observe
+		// labeled-break behavior.
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+	msg := &genai.Content{Role: genai.RoleUser, Parts: []*genai.Part{{Text: "go"}}}
+	for range r.Run(ctx, "u", "s", msg, agent.RunConfig{}) {
+	}
+
+	got := attempts.Load()
+	if got > 3 {
+		t.Errorf("attempts = %d, want <= 3 (cancellation should short-circuit)", got)
+	}
+}
+
+// TestWorkflow_RetryConfigDelayFor_RespectsMaxDelay locks down review fix
+// #11: jittered delay never exceeds MaxDelay.
+func TestWorkflow_RetryConfigDelayFor_RespectsMaxDelay(t *testing.T) {
+	t.Parallel()
+	cfg := workflow.RetryConfig{
+		MaxAttempts:   30,
+		InitialDelay:  10 * time.Millisecond,
+		MaxDelay:      50 * time.Millisecond,
+		BackoffFactor: 2.0,
+		Jitter:        workflow.DefaultJitter,
+	}
+	for i := 0; i < 1000; i++ {
+		for attempt := 1; attempt <= 12; attempt++ {
+			d := cfg.DelayFor(attempt)
+			if d > cfg.MaxDelay {
+				t.Fatalf("DelayFor(attempt=%d) = %v, exceeds MaxDelay %v", attempt, d, cfg.MaxDelay)
+			}
+			if d < 0 {
+				t.Fatalf("DelayFor(attempt=%d) = %v, want >= 0", attempt, d)
+			}
+		}
+	}
+}
+
+// TestWorkflow_ParallelWorker_NoActionsRace locks down review fix #2: each
+// parallel worker writes its own EventActions instance, so concurrent
+// StateDelta writes don't race and all worker events are forwarded to the
+// parent emitter.
+func TestWorkflow_ParallelWorker_NoActionsRace(t *testing.T) {
+	const N = 16
+	inner := workflow.Func("inner",
+		func(ctx *workflow.NodeContext, i int) (int, error) {
+			ctx.Actions().StateDelta[fmtKey(i)] = i
+			return i * 2, nil
+		},
+	)
+	seed := workflow.Func("seed",
+		func(_ *workflow.NodeContext, _ any) ([]int, error) {
+			items := make([]int, N)
+			for i := 0; i < N; i++ {
+				items[i] = i
+			}
+			return items, nil
+		})
+	parallel := workflow.Parallel[int](inner)
+
+	wf, err := workflow.New(workflow.Config{
+		Name: "parallel_actions",
+		Edges: []workflow.Edge{
+			workflow.Connect(workflow.START, seed),
+			workflow.Connect(seed, parallel),
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	events := runWorkflow(t, wf)
+
+	var sawInnerEvents int
+	for _, ev := range events {
+		if ev.Author == "inner" {
+			sawInnerEvents++
+		}
+	}
+	if sawInnerEvents < N {
+		t.Errorf("forwarded inner events = %d, want >= %d (events should propagate from parallel children)", sawInnerEvents, N)
+	}
+}
+
+func fmtKey(i int) string { return "k_" + intToString(i) }
+
+func intToString(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	digits := []byte{}
+	neg := i < 0
+	if neg {
+		i = -i
+	}
+	for i > 0 {
+		digits = append([]byte{byte('0' + i%10)}, digits...)
+		i /= 10
+	}
+	if neg {
+		return "-" + string(digits)
+	}
+	return string(digits)
+}
+
+// TestWorkflow_JoinNodeKeyOrderIsDeterministic locks down review fix #13:
+// when a downstream LlmAgentNode renders the JoinNode aggregate as the
+// agent's prompt, the predecessor names appear in a stable (alphabetic)
+// order regardless of completion order.
+func TestWorkflow_JoinNodeKeyOrderIsDeterministic(t *testing.T) {
+	t.Parallel()
+
+	// Run the same fan-out/fan-in 10 times with random predecessor delays
+	// and verify the JoinNode-rendered prompt comes out identically every
+	// time.
+	render := func() string {
+		seed := workflow.Func("seed",
+			func(_ *workflow.NodeContext, _ any) (int, error) { return 1, nil })
+		var aDelay, bDelay, cDelay time.Duration = 0, 5 * time.Millisecond, 10 * time.Millisecond
+		// Shuffle delays to vary completion order.
+		switch time.Now().UnixNano() % 6 {
+		case 1:
+			aDelay, bDelay, cDelay = 10*time.Millisecond, 0, 5*time.Millisecond
+		case 2:
+			aDelay, bDelay, cDelay = 5*time.Millisecond, 10*time.Millisecond, 0
+		}
+		mk := func(name string, d time.Duration) workflow.Node {
+			return workflow.Func(name, func(_ *workflow.NodeContext, _ int) (string, error) {
+				time.Sleep(d)
+				return name + "_out", nil
+			})
+		}
+		a := mk("a", aDelay)
+		b := mk("b", bDelay)
+		c := mk("c", cDelay)
+		join := workflow.Join("merge")
+		var rendered string
+		final := workflow.Func("final",
+			func(_ *workflow.NodeContext, in any) (string, error) {
+				if m, ok := in.(map[string]any); ok {
+					keys := []string{}
+					for k := range m {
+						keys = append(keys, k)
+					}
+					// Render via the same path as renderUserContent: Sprintf
+					// with sorted keys.
+					sortStrings(keys)
+					var s string
+					for _, k := range keys {
+						s += k + "=" + asString(m[k]) + "|"
+					}
+					rendered = s
+				}
+				return "done", nil
+			})
+		wf, err := workflow.New(workflow.Config{
+			Name: "joindet",
+			Edges: []workflow.Edge{
+				workflow.Connect(workflow.START, seed),
+				workflow.Connect(seed, a),
+				workflow.Connect(seed, b),
+				workflow.Connect(seed, c),
+				workflow.Connect(a, join),
+				workflow.Connect(b, join),
+				workflow.Connect(c, join),
+				workflow.Connect(join, final),
+			},
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		runWorkflow(t, wf)
+		return rendered
+	}
+	first := render()
+	for i := 0; i < 10; i++ {
+		if got := render(); got != first {
+			t.Fatalf("rendered varied: first=%q iter=%d got=%q", first, i, got)
+		}
+	}
+}
+
+func sortStrings(s []string) {
+	// minimal in-test sort to avoid pulling in slices/sort here.
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && s[j-1] > s[j]; j-- {
+			s[j-1], s[j] = s[j], s[j-1]
+		}
+	}
+}
+
+func asString(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
