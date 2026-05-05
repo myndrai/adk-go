@@ -238,3 +238,49 @@ func TestIsTransient(t *testing.T) {
 	}
 	_ = mustErr
 }
+
+// TestDelayFor_RespectsMaxDelay locks down review fix #11: jitter is applied
+// after the MaxDelay clamp, but the post-jitter delay is re-clamped so the
+// configured ceiling is never exceeded.
+func TestDelayFor_RespectsMaxDelay(t *testing.T) {
+	t.Parallel()
+	cfg := Config{
+		MaxAttempts:   30,
+		InitialDelay:  10 * time.Millisecond,
+		MaxDelay:      50 * time.Millisecond,
+		BackoffFactor: 2.0,
+		Jitter:        DefaultJitter,
+	}.withDefaults()
+	r := &retrier{cfg: cfg}
+	for i := 0; i < 1000; i++ {
+		for attempt := 1; attempt <= 12; attempt++ {
+			d := r.delayFor(attempt)
+			if d > cfg.MaxDelay {
+				t.Fatalf("delayFor(attempt=%d) = %v, exceeds MaxDelay %v", attempt, d, cfg.MaxDelay)
+			}
+			if d < 0 {
+				t.Fatalf("delayFor(attempt=%d) = %v, want >= 0", attempt, d)
+			}
+		}
+	}
+}
+
+// TestDelayFor_ZeroJitterIsDeterministic locks down review fix #10: a Config
+// with Jitter==0 (the Go zero value) produces deterministic delays.
+func TestDelayFor_ZeroJitterIsDeterministic(t *testing.T) {
+	t.Parallel()
+	cfg := Config{
+		MaxAttempts:   5,
+		InitialDelay:  10 * time.Millisecond,
+		MaxDelay:      10 * time.Second,
+		BackoffFactor: 2.0,
+		// Jitter omitted ⇒ zero ⇒ disabled.
+	}.withDefaults()
+	r := &retrier{cfg: cfg}
+	first := r.delayFor(3)
+	for i := 0; i < 100; i++ {
+		if got := r.delayFor(3); got != first {
+			t.Fatalf("delayFor(3) varied: first=%v iter=%d got=%v", first, i, got)
+		}
+	}
+}
