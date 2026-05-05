@@ -117,15 +117,19 @@ func AutoFlow(m model.LLM, tools ...tool.Tool) *Flow {
 	}
 }
 
-// SingleFlow returns a Flow with the request-side processors but no
-// looping — the LlmAgent runtime decides when to stop. In practice
-// SingleFlow is the same shape as AutoFlow but documented as the
-// "single-call, no automatic tool loop" preset for callers that prefer
-// to drive iteration externally.
+// SingleFlow is an alias constructor for AutoFlow, kept for parity with
+// adk-python's `SingleFlow` naming.
 //
-// Mirrors Python's SingleFlow naming. The looping behavior is enforced
-// at the caller layer in adk-go because Flow.Run already terminates on a
-// final response.
+// In adk-python, SingleFlow and AutoFlow are distinct classes
+// (single_flow.py + auto_flow.py: AutoFlow extends SingleFlow), with
+// AutoFlow adding agent-transfer capability. v2 Go is a hard fork: the
+// Flow runtime is a single shape that already terminates on a final
+// response, so there is no behavioral difference between the two
+// presets in this package — the alias exists so code porting from
+// Python doesn't have to rename the call site.
+//
+// Prefer AutoFlow in new code. SingleFlow may be removed if the Python
+// API stops referencing it.
 func SingleFlow(m model.LLM, tools ...tool.Tool) *Flow {
 	return AutoFlow(m, tools...)
 }
