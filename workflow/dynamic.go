@@ -71,6 +71,13 @@ func newDynamicScheduler() *dynamicScheduler {
 // Events emitted by the child are forwarded into the parent's emitter (so
 // they reach the workflow's iter.Seq2 in order).
 //
+// Concurrency contract: RunNode must be called from the parent node's
+// RunImpl goroutine. The per-NodeContext scheduler is initialized lazily
+// without locking and is not safe to call from multiple goroutines spawned
+// inside one RunImpl. If a parent needs to fan out, use ParallelWorker (it
+// constructs an independent NodeContext per worker), not concurrent
+// RunNode calls on the same NodeContext.
+//
 // Dedup: the scheduler scans session events for prior runs at the
 // resolved node_path. If a completed prior run is found, its output is
 // returned immediately without executing the node. Mirrors adk-python's
