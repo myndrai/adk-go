@@ -23,10 +23,36 @@ import (
 	"google.golang.org/genai"
 
 	"google.golang.org/adk/agent"
+	adkapp "google.golang.org/adk/app"
 	"google.golang.org/adk/runner"
 	"google.golang.org/adk/session"
 	"google.golang.org/adk/workflow"
 )
+
+// resumableRunner constructs a Runner whose App enables ResumabilityConfig
+// so that Runner.Resume is permitted (PR-A introduced ErrNotResumable
+// gating). The workflow rehydration path lives inside the orchestrator;
+// the runner only needs to authorize the call.
+func resumableRunner(t *testing.T, name string, root agent.Agent, sess session.Service) *runner.Runner {
+	t.Helper()
+	appCfg, err := adkapp.New(adkapp.App{
+		Name:               name,
+		RootAgent:          root,
+		ResumabilityConfig: &adkapp.ResumabilityConfig{IsResumable: true},
+	})
+	if err != nil {
+		t.Fatalf("app.New: %v", err)
+	}
+	r, err := runner.New(runner.Config{
+		App:               appCfg,
+		SessionService:    sess,
+		AutoCreateSession: true,
+	})
+	if err != nil {
+		t.Fatalf("runner.New: %v", err)
+	}
+	return r
+}
 
 // TestWorkflow_Resume_SkipsCompletedNodes verifies that on a Resume call,
 // nodes that already produced output in the prior invocation do not run
@@ -72,15 +98,7 @@ func TestWorkflow_Resume_SkipsCompletedNodes(t *testing.T) {
 	wfAgent, _ := wf.AsAgent()
 
 	sessSvc := session.InMemoryService()
-	r, err := runner.New(runner.Config{
-		AppName:           "test",
-		Agent:             wfAgent,
-		SessionService:    sessSvc,
-		AutoCreateSession: true,
-	})
-	if err != nil {
-		t.Fatalf("runner.New: %v", err)
-	}
+	r := resumableRunner(t, "test", wfAgent, sessSvc)
 
 	// First run: a succeeds, b fails. Workflow aborts.
 	msg := &genai.Content{Role: genai.RoleUser, Parts: []*genai.Part{{Text: "go"}}}
@@ -136,12 +154,7 @@ func TestWorkflow_Resume_RerunOnResumeForcesRerun(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	wfAgent, _ := wf.AsAgent()
-	r, _ := runner.New(runner.Config{
-		AppName:           "t",
-		Agent:             wfAgent,
-		SessionService:    session.InMemoryService(),
-		AutoCreateSession: true,
-	})
+	r := resumableRunner(t, "t", wfAgent, session.InMemoryService())
 	msg := &genai.Content{Role: genai.RoleUser, Parts: []*genai.Part{{Text: "x"}}}
 	for range r.Run(context.Background(), "u", "s", msg, agent.RunConfig{}) {
 	}
