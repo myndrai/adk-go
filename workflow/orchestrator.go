@@ -47,7 +47,7 @@ func (w *Workflow) runSequential(
 ) iter.Seq2[*session.Event, error] {
 	return func(yield func(*session.Event, error) bool) {
 		path := engine.JoinPath(parentPath, w.Name(), 1)
-		state := newRunState(w.graph, input, path)
+		state := newRunState(w.graph, input)
 
 		// Phase 4: rehydrate from session events. If the session already has
 		// completed events for nodes in this workflow, skip them and queue
@@ -205,6 +205,7 @@ func (w *Workflow) runNode(
 		emitted  []*session.Event
 		gotRoute *Route
 	)
+Attempt:
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		em := newCollectingEmitter(node, ic, ref.runID, w.nodePathFor(ref.name, ref.runID))
 		ctxAttempt := ctx
@@ -255,7 +256,10 @@ func (w *Workflow) runNode(
 		case <-time.After(delay):
 		case <-ctx.Done():
 			err = ctx.Err()
-			break
+			// Use a labeled break so we exit the attempt loop, not just
+			// the select. A bare `break` here only stops the select and
+			// would let a cancelled context burn additional attempts.
+			break Attempt
 		}
 	}
 
@@ -314,8 +318,18 @@ func runNodeOnce(
 var ErrNodeTimeout = errors.New("workflow: node timed out")
 
 // shouldRetry reports whether err is retryable under cfg.
+//
+// Context cancellation and deadline expiry are never retried, even when
+// cfg.Retryable is empty (which otherwise allows any error). This mirrors
+// adk-python's _should_retry_node behavior: Python's `except Exception`
+// doesn't catch asyncio.CancelledError (BaseException since 3.8), so a
+// cancelled task naturally bypasses the retry path. The Go equivalent is
+// to treat context.Canceled / context.DeadlineExceeded as terminal.
 func shouldRetry(err error, cfg *RetryConfig) bool {
 	if err == nil || cfg == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
 	if len(cfg.Retryable) == 0 {
@@ -370,7 +384,7 @@ type readyRef struct {
 	resumeInputs map[string]any
 }
 
-func newRunState(g *workflowGraph, input any, _ string) *runState {
+func newRunState(g *workflowGraph, input any) *runState {
 	s := &runState{
 		graph:               g,
 		runIDs:              map[string]int{},
@@ -479,10 +493,16 @@ func routeMatches(got *Route, allowed []Route) bool {
 }
 
 // collectingEmitter buffers events during a node's RunImpl invocation.
-// The orchestrator forwards the buffered events to the live events
-// channel after the node completes (or on each yield in streaming nodes —
-// streaming is implemented in the live forwarding path; the orchestrator
-// reads em.events after RunImpl returns).
+// The orchestrator reads em.events after RunImpl returns and forwards them
+// to the workflow's iter.Seq2 consumer in batch.
+//
+// Buffered semantics: events are NOT streamed live to the consumer while
+// RunImpl is running. They are held until the entire attempt sequence
+// (including any retries) completes; events from a failed-and-retried
+// attempt are discarded so only the surviving attempt's events reach the
+// consumer. Nodes that wish to stream incrementally cannot do so through
+// this emitter; that is by design — the retry contract requires the
+// ability to discard a partial attempt's events.
 type collectingEmitter struct {
 	node     Node
 	ic       agent.InvocationContext
@@ -515,14 +535,40 @@ func (e *collectingEmitter) Output(v any) error {
 	ev.Branch = e.ic.Branch()
 	ev.LLMResponse = model.LLMResponse{}
 	if e.ctx != nil {
-		ev.Actions.StateDelta = e.ctx.Actions().StateDelta
-		ev.Actions.ArtifactDelta = e.ctx.Actions().ArtifactDelta
+		// Snapshot the state and artifact deltas onto the event. Aliasing
+		// the maps would let later StateDelta() / ArtifactDelta() calls in
+		// the same RunImpl retroactively mutate an already-emitted event,
+		// which produces non-deterministic event payloads under streaming.
+		ev.Actions.StateDelta = cloneStateDelta(e.ctx.Actions().StateDelta)
+		ev.Actions.ArtifactDelta = cloneArtifactDelta(e.ctx.Actions().ArtifactDelta)
 	}
 	e.attachNodeInfo(ev, false)
 	ev.Actions.NodeInfo.Output = v
 	e.events = append(e.events, ev)
 	e.outputs = append(e.outputs, v)
 	return nil
+}
+
+func cloneStateDelta(src map[string]any) map[string]any {
+	if src == nil {
+		return nil
+	}
+	out := make(map[string]any, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneArtifactDelta(src map[string]int64) map[string]int64 {
+	if src == nil {
+		return nil
+	}
+	out := make(map[string]int64, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
 }
 
 func (e *collectingEmitter) RequestInput(r RequestInput) error {
