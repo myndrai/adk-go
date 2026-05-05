@@ -531,3 +531,155 @@ func TestRunner_New_AppConfig(t *testing.T) {
 		}
 	})
 }
+
+// TestRunner_BeforeRunEarlyExit_NoDuplicateUserEvent locks down review fix #3:
+// when a BeforeRunCallback short-circuits the agent run, the runner must
+// surface the early-exit response without re-appending a second user-authored
+// event for the same user message. Mirrors adk-python runners.py:1166-1180.
+func TestRunner_BeforeRunEarlyExit_NoDuplicateUserEvent(t *testing.T) {
+	t.Parallel()
+
+	testAgent := must(agent.New(agent.Config{
+		Name: "stub_agent",
+		Run: func(ctx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+			return func(yield func(*session.Event, error) bool) {
+				t.Error("agent.Run should not be invoked when BeforeRun short-circuits")
+			}
+		},
+	}))
+
+	earlyExitContent := genai.NewContentFromText("plugin says nope", genai.RoleModel)
+	earlyExitPlugin, err := plugin.New(plugin.Config{
+		Name: "early_exit",
+		BeforeRunCallback: func(_ agent.InvocationContext) (*genai.Content, error) {
+			return earlyExitContent, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("plugin.New: %v", err)
+	}
+
+	appCfg, err := adkapp.New(adkapp.App{
+		Name:      "earlyapp",
+		RootAgent: testAgent,
+		Plugins:   []*plugin.Plugin{earlyExitPlugin},
+	})
+	if err != nil {
+		t.Fatalf("app.New: %v", err)
+	}
+	sess := session.InMemoryService()
+	r, err := New(Config{
+		App:               appCfg,
+		SessionService:    sess,
+		AutoCreateSession: true,
+	})
+	if err != nil {
+		t.Fatalf("runner.New: %v", err)
+	}
+
+	userMsg := genai.NewContentFromText("hi", genai.RoleUser)
+	var seenAuthors []string
+	for ev, err := range r.Run(t.Context(), "u", "s", userMsg, agent.RunConfig{}) {
+		if err != nil {
+			t.Fatalf("Run: unexpected error: %v", err)
+		}
+		seenAuthors = append(seenAuthors, ev.Author)
+	}
+
+	got, err := sess.Get(t.Context(), &session.GetRequest{AppName: "earlyapp", UserID: "u", SessionID: "s"})
+	if err != nil {
+		t.Fatalf("session.Get: %v", err)
+	}
+
+	var stored []string
+	for ev := range got.Session.Events().All() {
+		stored = append(stored, ev.Author)
+	}
+
+	wantStored := []string{"user", testAgent.Name()}
+	if len(stored) != len(wantStored) {
+		t.Fatalf("session events authors = %v, want %v", stored, wantStored)
+	}
+	for i, a := range wantStored {
+		if stored[i] != a {
+			t.Errorf("event[%d].Author = %q, want %q (full = %v)", i, stored[i], a, stored)
+		}
+	}
+
+	// The yielded stream should expose only the early-exit event, not a
+	// duplicate user event.
+	if len(seenAuthors) != 1 || seenAuthors[0] != testAgent.Name() {
+		t.Errorf("yielded authors = %v, want [%s]", seenAuthors, testAgent.Name())
+	}
+}
+
+// TestRunner_RunNilMsg_NotResumable locks down review fix #4: calling Run
+// with msg == nil on a runner whose App is not resumable must yield
+// ErrNotResumable. Mirrors adk-python runners.py:884.
+func TestRunner_RunNilMsg_NotResumable(t *testing.T) {
+	t.Parallel()
+
+	testAgent := must(agent.New(agent.Config{
+		Name: "stub_agent",
+		Run: func(ctx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+			return func(yield func(*session.Event, error) bool) {
+				t.Error("agent.Run should not be invoked when msg is nil and app is not resumable")
+			}
+		},
+	}))
+
+	appCfg, err := adkapp.New(adkapp.App{Name: "app1", RootAgent: testAgent})
+	if err != nil {
+		t.Fatalf("app.New: %v", err)
+	}
+	r, err := New(Config{
+		App:               appCfg,
+		SessionService:    session.InMemoryService(),
+		AutoCreateSession: true,
+	})
+	if err != nil {
+		t.Fatalf("runner.New: %v", err)
+	}
+
+	var got error
+	for _, err := range r.Run(t.Context(), "u", "s", nil, agent.RunConfig{}) {
+		got = err
+		break
+	}
+	if got == nil || got.Error() != ErrNotResumable.Error() {
+		t.Errorf("Run(nil msg) error = %v, want ErrNotResumable", got)
+	}
+}
+
+// TestRunner_Resume_NotResumable locks down that Resume on a non-resumable
+// app yields ErrNotResumable.
+func TestRunner_Resume_NotResumable(t *testing.T) {
+	t.Parallel()
+
+	testAgent := must(agent.New(agent.Config{
+		Name: "stub_agent",
+		Run: func(ctx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+			return func(yield func(*session.Event, error) bool) {}
+		},
+	}))
+	appCfg, err := adkapp.New(adkapp.App{Name: "app1", RootAgent: testAgent})
+	if err != nil {
+		t.Fatalf("app.New: %v", err)
+	}
+	r, err := New(Config{
+		App:               appCfg,
+		SessionService:    session.InMemoryService(),
+		AutoCreateSession: true,
+	})
+	if err != nil {
+		t.Fatalf("runner.New: %v", err)
+	}
+	var got error
+	for _, err := range r.Resume(t.Context(), "u", "s", agent.RunConfig{}) {
+		got = err
+		break
+	}
+	if got == nil || got.Error() != ErrNotResumable.Error() {
+		t.Errorf("Resume() error = %v, want ErrNotResumable", got)
+	}
+}
