@@ -19,6 +19,8 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+
+	"google.golang.org/adk/session"
 )
 
 // ParallelWorker fans out an inner Node across each element of an input
@@ -82,6 +84,17 @@ func Parallel[T any](inner Node, opts ...ParallelOption) *ParallelWorker[T] {
 
 // RunImpl runs the inner node once per element of the input slice. Errors
 // from any worker abort the lot via context cancellation.
+//
+// Concurrency model:
+//   - Each worker gets its own *session.EventActions, populated through a
+//     fresh per-worker NodeContext. Workers never share the parent's actions
+//     map, so their concurrent StateDelta / ArtifactDelta writes can't race.
+//   - After all workers finish, the parent goroutine merges per-worker
+//     actions into the parent's actions deterministically by input index.
+//   - Each worker's collectingEmitter buffers events; after the merge step
+//     the parent forwards every buffered event to the parent emitter, also
+//     in input-index order, so the workflow's iter.Seq2 sees a stable
+//     sequence per parallel batch.
 func (p *ParallelWorker[T]) RunImpl(ctx *NodeContext, input any, em EventEmitter) error {
 	items, err := coerceParallelInput[T](input)
 	if err != nil {
@@ -97,6 +110,8 @@ func (p *ParallelWorker[T]) RunImpl(ctx *NodeContext, input any, em EventEmitter
 
 	results := make([]any, len(items))
 	errs := make([]error, len(items))
+	subEms := make([]*collectingEmitter, len(items))
+	subActions := make([]*session.EventActions, len(items))
 
 	var sem chan struct{}
 	if p.maxConcurrency > 0 {
@@ -122,14 +137,20 @@ func (p *ParallelWorker[T]) RunImpl(ctx *NodeContext, input any, em EventEmitter
 			if cctx.Err() != nil {
 				return
 			}
+			workerActions := &session.EventActions{
+				StateDelta:    map[string]any{},
+				ArtifactDelta: map[string]int64{},
+			}
+			subActions[i] = workerActions
 			child := &NodeContext{
 				InvocationContext: ctx.InvocationContext,
 				nodePath:          fmt.Sprintf("%s/[%d]", ctx.NodePath(), i),
 				runID:             fmt.Sprintf("%d", i),
-				actions:           ctx.actions,
+				actions:           workerActions,
 			}
 			subEm := newCollectingEmitter(p.inner, ctx.InvocationContext, i, child.NodePath())
 			subEm.ctx = child
+			subEms[i] = subEm
 			if err := p.inner.RunImpl(child, items[i], subEm); err != nil {
 				errs[i] = err
 				cancel()
@@ -148,6 +169,42 @@ wait:
 			return e
 		}
 	}
+
+	// Merge worker actions into parent in input-index order. State delta
+	// keys collide last-write-wins by index.
+	if ctx.actions != nil {
+		for _, a := range subActions {
+			if a == nil {
+				continue
+			}
+			if ctx.actions.StateDelta == nil {
+				ctx.actions.StateDelta = map[string]any{}
+			}
+			for k, v := range a.StateDelta {
+				ctx.actions.StateDelta[k] = v
+			}
+			if ctx.actions.ArtifactDelta == nil {
+				ctx.actions.ArtifactDelta = map[string]int64{}
+			}
+			for k, v := range a.ArtifactDelta {
+				ctx.actions.ArtifactDelta[k] = v
+			}
+		}
+	}
+
+	// Forward buffered worker events to the parent emitter in input-index
+	// order so the workflow's iter.Seq2 consumer sees a stable sequence.
+	for _, sub := range subEms {
+		if sub == nil {
+			continue
+		}
+		for _, ev := range sub.events {
+			if err := em.Event(ev); err != nil {
+				return err
+			}
+		}
+	}
+
 	return em.Output(results)
 }
 
