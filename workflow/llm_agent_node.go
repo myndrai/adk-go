@@ -15,8 +15,8 @@
 package workflow
 
 import (
-	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"google.golang.org/genai"
@@ -119,10 +119,18 @@ func renderUserContent(input any) *genai.Content {
 		return &genai.Content{Role: genai.RoleUser, Parts: []*genai.Part{{Text: v}}}
 	case map[string]any:
 		// Output of JoinNode: render each predecessor's contribution as a
-		// labeled paragraph so the next agent has clean context.
+		// labeled paragraph so the next agent has clean context. Sort by
+		// predecessor name so the rendered prompt is deterministic across
+		// runs (Go map iteration order is randomized) — important for
+		// replay, eval, and prompt caching.
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		slices.Sort(keys)
 		var b strings.Builder
-		for k, val := range v {
-			fmt.Fprintf(&b, "## %s\n%v\n\n", k, val)
+		for _, k := range keys {
+			fmt.Fprintf(&b, "## %s\n%v\n\n", k, v[k])
 		}
 		return &genai.Content{Role: genai.RoleUser, Parts: []*genai.Part{{Text: b.String()}}}
 	default:
@@ -145,5 +153,3 @@ func extractText(c *genai.Content) string {
 	}
 	return b.String()
 }
-
-var _ = errors.New
