@@ -49,13 +49,17 @@ type Config struct {
 	BackoffFactor float64
 
 	// Jitter is a multiplicative jitter window applied to each delay,
-	// uniformly random in [1-jitter, 1+jitter].
+	// uniformly random in [1-jitter, 1+jitter]. The post-jitter delay is
+	// re-clamped to MaxDelay so jitter never lengthens the worst-case wait.
 	//
-	// Resolution rules (the zero value triggers the default; an
-	// explicit negative value disables jitter):
-	//   0  → use the default of 0.5 (the natural Go zero value)
-	//   <0 → no jitter (deterministic delays — useful in tests)
-	//   >0 → use that value as the window
+	// Resolution rules:
+	//   0  → disabled — deterministic delays (the Go zero value)
+	//   >0 → use that value as the window (DefaultJitter is a typical choice)
+	//
+	// Note: this differs from adk-python's RetryConfig, which defaults a
+	// missing jitter to 1.0. v2 is a hard fork; the Go API picks
+	// zero-is-disabled to match Go's zero-value intuition. Use DefaultJitter
+	// to opt into the Python-style 0.5 window.
 	Jitter float64
 
 	// RetryOn classifies an error as retriable. If nil, IsTransient is used.
@@ -67,6 +71,10 @@ type Config struct {
 	// failed (i.e. the next attempt will be attempt+1).
 	OnRetry func(attempt int, err error, delay time.Duration)
 }
+
+// DefaultJitter is the recommended jitter window when callers want
+// non-deterministic backoff. Set Config.Jitter to this to opt in.
+const DefaultJitter = 0.5
 
 func (c Config) withDefaults() Config {
 	if c.MaxAttempts <= 0 {
@@ -83,8 +91,6 @@ func (c Config) withDefaults() Config {
 	}
 	if c.Jitter < 0 {
 		c.Jitter = 0
-	} else if c.Jitter == 0 {
-		c.Jitter = 0.5
 	}
 	if c.RetryOn == nil {
 		c.RetryOn = IsTransient
@@ -184,6 +190,11 @@ func (r *retrier) delayFor(attempt int) time.Duration {
 		// Uniform multiplicative jitter in [1-j, 1+j].
 		factor := 1 + (rand.Float64()*2-1)*r.cfg.Jitter
 		d = time.Duration(float64(d) * factor)
+	}
+	// Re-clamp post-jitter so the multiplicative window can't push the
+	// delay above the configured ceiling.
+	if d > r.cfg.MaxDelay {
+		d = r.cfg.MaxDelay
 	}
 	if d < 0 {
 		d = 0
