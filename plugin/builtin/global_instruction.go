@@ -86,9 +86,16 @@ func GlobalInstruction(cfg GlobalInstructionConfig) (*plugin.Plugin, error) {
 				Parts: []*genai.Part{{Text: text}},
 			}
 		default:
-			// Prepend a Part with the global instruction so it leads.
-			parts := append([]*genai.Part{{Text: text}}, existing.Parts...)
-			existing.Parts = parts
+			// Build a fresh Parts slice so we don't mutate the caller's
+			// existing.Parts backing array — other request processors or
+			// downstream code may hold a reference to it.
+			newParts := make([]*genai.Part, 0, len(existing.Parts)+1)
+			newParts = append(newParts, &genai.Part{Text: text})
+			newParts = append(newParts, existing.Parts...)
+			req.Config.SystemInstruction = &genai.Content{
+				Role:  existing.Role,
+				Parts: newParts,
+			}
 		}
 		return nil, nil
 	}
