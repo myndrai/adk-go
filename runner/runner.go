@@ -168,14 +168,50 @@ type Runner struct {
 	appCfg *app.App
 }
 
+// ErrNotResumable is returned by Run/Resume when no new message is provided
+// and the runner's App does not have ResumabilityConfig.IsResumable set.
+// Mirrors adk-python runners.py:884.
+var ErrNotResumable = errors.New("runner: running an agent requires a new_message or a resumable app")
+
+// Resume re-enters an existing session without appending a new user message.
+// The root agent gets a chance to rehydrate from prior session events and
+// continue from the first non-completed point. Resume only succeeds when the
+// runner was constructed via Config.App with ResumabilityConfig.IsResumable
+// set; otherwise it yields ErrNotResumable.
+//
+// In this foundation PR Resume is the API surface only — the actual workflow
+// rehydration semantics arrive with the workflow package in a later PR.
+func (r *Runner) Resume(ctx context.Context, userID, sessionID string, cfg agent.RunConfig, opts ...RunOption) iter.Seq2[*session.Event, error] {
+	if !r.isResumable() {
+		return func(yield func(*session.Event, error) bool) {
+			yield(nil, ErrNotResumable)
+		}
+	}
+	return r.Run(ctx, userID, sessionID, nil, cfg, opts...)
+}
+
+// isResumable reports whether the runner's App is configured to permit
+// resume invocations (msg=nil).
+func (r *Runner) isResumable() bool {
+	return r.appCfg != nil && r.appCfg.ResumabilityConfig != nil && r.appCfg.ResumabilityConfig.IsResumable
+}
+
 // Run runs the agent for the given user input, yielding events from agents.
 // For each user message it finds the proper agent within an agent tree to
 // continue the conversation within the session.
+//
+// Calling Run with msg == nil is only valid when the runner was constructed
+// from an App whose ResumabilityConfig.IsResumable is true. Otherwise Run
+// yields ErrNotResumable. Mirrors adk-python runners.py:884.
 func (r *Runner) Run(ctx context.Context, userID, sessionID string, msg *genai.Content, cfg agent.RunConfig, opts ...RunOption) iter.Seq2[*session.Event, error] {
 	// TODO(hakim): we need to validate whether cfg is compatible with the Agent.
 	//   see adk-python/src/google/adk/runners.py Runner._new_invocation_context.
 	// TODO: setup tracer.
 	return func(yield func(*session.Event, error) bool) {
+		if msg == nil && !r.isResumable() {
+			yield(nil, ErrNotResumable)
+			return
+		}
 		options := runOptions{}
 		for _, opt := range opts {
 			opt(&options)
@@ -260,16 +296,27 @@ func (r *Runner) Run(ctx context.Context, userID, sessionID string, msg *genai.C
 
 			earlyExitResult, err := pluginManager.RunBeforeRunCallback(ctx)
 			if earlyExitResult != nil || err != nil {
-				earlyExitEvent := session.NewEvent(ctx.InvocationID())
-				earlyExitEvent.Author = "user"
-				earlyExitEvent.LLMResponse = model.LLMResponse{
-					Content: msg,
-				}
-				if err := r.sessionService.AppendEvent(ctx, storedSession, earlyExitEvent); err != nil {
-					yield(nil, fmt.Errorf("failed to add event to session: %w", err))
+				// The user message has already been appended to the session by
+				// appendMessageToSession above. Don't append a second user-authored
+				// duplicate here. When the BeforeRun plugin produced an
+				// early-exit content, surface it as an agent-authored event;
+				// when it only returned an error, surface the error alone.
+				// Mirrors adk-python runners.py:1166-1180.
+				if earlyExitResult != nil {
+					earlyExitEvent := session.NewEvent(ctx.InvocationID())
+					earlyExitEvent.Author = agentToRun.Name()
+					earlyExitEvent.Branch = ctx.Branch()
+					earlyExitEvent.LLMResponse = model.LLMResponse{
+						Content: earlyExitResult,
+					}
+					if appendErr := r.sessionService.AppendEvent(ctx, storedSession, earlyExitEvent); appendErr != nil {
+						yield(nil, fmt.Errorf("failed to add event to session: %w", appendErr))
+						return
+					}
+					yield(earlyExitEvent, err)
 					return
 				}
-				yield(earlyExitEvent, err)
+				yield(nil, err)
 				return
 			}
 		}
