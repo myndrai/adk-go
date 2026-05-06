@@ -15,8 +15,9 @@
 package llminternal
 
 import (
+	"context"
 	"fmt"
-	"iter"
+	"slices"
 	"strings"
 
 	"google.golang.org/genai"
@@ -28,6 +29,32 @@ import (
 	"google.golang.org/adk/model"
 	"google.golang.org/adk/session"
 )
+
+// taskDepthKey is the context.Context key that tracks how many task
+// delegations are nested in the current call chain.
+type taskDepthKey struct{}
+
+// DefaultMaxTaskDepth caps how deep coordinator→task→coordinator chains
+// can recurse before the runtime synthesizes an error response instead of
+// invoking the next task agent. Override via WithMaxTaskDepth on the
+// invocation context.
+const DefaultMaxTaskDepth = 4
+
+// taskDepth returns the current task-delegation depth pulled from ctx,
+// or 0 if unset.
+func taskDepth(ctx context.Context) int {
+	if v := ctx.Value(taskDepthKey{}); v != nil {
+		if d, ok := v.(int); ok {
+			return d
+		}
+	}
+	return 0
+}
+
+// withTaskDepth returns a context whose task-depth counter is one higher.
+func withTaskDepth(ctx context.Context, d int) context.Context {
+	return context.WithValue(ctx, taskDepthKey{}, d)
+}
 
 // runTaskRequests handles any session.TaskRequest entries the coordinator
 // produced via task.NewRequestTaskTool. For each (function_call_id,
@@ -51,18 +78,50 @@ func (f *Flow) runTaskRequests(
 	if ev == nil || len(ev.Actions.RequestTask) == 0 {
 		return true
 	}
+	depth := taskDepth(ctx)
+	maxDepth := DefaultMaxTaskDepth
 	parents := parentmap.FromContext(ctx)
 	for callID, req := range ev.Actions.RequestTask {
+		if depth >= maxDepth {
+			// Synthesize a guard FunctionResponse instead of running the
+			// task agent so the coordinator can react gracefully (e.g.
+			// fall back to a different plan or surface the limit to the
+			// user) rather than the runtime hanging in a recursion loop.
+			payload := map[string]any{
+				"error":    fmt.Sprintf("task delegation depth %d exceeded max %d", depth, maxDepth),
+				"agent":    req.AgentName,
+				"callID":   callID,
+				"maxDepth": maxDepth,
+			}
+			fr := session.NewEvent(ctx.InvocationID())
+			fr.Author = ctx.Agent().Name()
+			fr.Branch = ctx.Branch()
+			fr.LLMResponse = model.LLMResponse{
+				Content: &genai.Content{
+					Role: genai.RoleUser,
+					Parts: []*genai.Part{{
+						FunctionResponse: &genai.FunctionResponse{
+							ID:       callID,
+							Name:     req.AgentName,
+							Response: payload,
+						},
+					}},
+				},
+			}
+			if !yield(fr, nil) {
+				return false
+			}
+			continue
+		}
 		taskAgent := findAgentByName(ctx.Agent(), parents, req.AgentName)
 		if taskAgent == nil {
 			yield(nil, fmt.Errorf("task: agent %q not found in tree", req.AgentName))
 			return false
 		}
 		// Build a child invocation context whose UserContent renders the
-		// task input. The task agent runs as a sub-call: ownership stays
-		// with the coordinator, so we don't go through the runner's
-		// findAgentToRun path.
-		childCtx := newTaskChildContext(ctx, taskAgent, req)
+		// task input and whose context value increments the delegation
+		// depth so coordinator-task-coordinator chains terminate.
+		childCtx := newTaskChildContext(ctx, taskAgent, req, depth+1)
 		var finish *session.TaskResult
 		for childEv, err := range taskAgent.Run(childCtx) {
 			if !yield(childEv, err) {
@@ -129,13 +188,17 @@ func findAgentByName(start agent.Agent, parents parentmap.Map, name string) agen
 // Mirrors the scaffolding in agent.Run: a fresh InvocationContext with
 // the same session/services, but UserContent rendered from the task
 // input so the task agent's contents-builder picks it up naturally.
-func newTaskChildContext(parent agent.InvocationContext, taskAgent agent.Agent, req session.TaskRequest) agent.InvocationContext {
+//
+// The newDepth value is propagated through ctx.Value(taskDepthKey{}) so
+// nested coordinator→task→coordinator chains observe the running depth
+// and terminate at DefaultMaxTaskDepth.
+func newTaskChildContext(parent agent.InvocationContext, taskAgent agent.Agent, req session.TaskRequest, newDepth int) agent.InvocationContext {
 	rendered := renderTaskInput(req)
 	uc := &genai.Content{
 		Role:  genai.RoleUser,
 		Parts: []*genai.Part{{Text: rendered}},
 	}
-	return icontext.NewInvocationContext(parent, icontext.InvocationContextParams{
+	child := icontext.NewInvocationContext(parent, icontext.InvocationContextParams{
 		Artifacts:    parent.Artifacts(),
 		Memory:       parent.Memory(),
 		Session:      parent.Session(),
@@ -144,22 +207,25 @@ func newTaskChildContext(parent agent.InvocationContext, taskAgent agent.Agent, 
 		RunConfig:    parent.RunConfig(),
 		InvocationID: parent.InvocationID(),
 	})
+	return child.WithContext(withTaskDepth(child, newDepth))
 }
 
 // renderTaskInput formats a TaskRequest's input as a human-readable
-// string. Mirrors adk-python's render_task_input — labels each field,
-// flagged with a single-turn nudge when applicable. Single-turn vs
-// multi-turn distinction will be wired once the task agent's Mode is
-// surfaced through agent.Agent (Phase 6D2); for Phase 6D the renderer
-// emits the labelled body without the single-turn warning.
+// string. Mirrors adk-python's render_task_input — labels each field.
+//
+// Keys are sorted alphabetically before formatting so the rendered prompt
+// is deterministic across runs (Go map iteration is randomized). Replay,
+// eval, and prompt caching all rely on stable input rendering.
 func renderTaskInput(req session.TaskRequest) string {
 	var b strings.Builder
 	b.WriteString("[Delegated Task]\n")
-	for k, v := range req.Input {
-		fmt.Fprintf(&b, "%s: %v\n", k, v)
+	keys := make([]string, 0, len(req.Input))
+	for k := range req.Input {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	for _, k := range keys {
+		fmt.Fprintf(&b, "%s: %v\n", k, req.Input[k])
 	}
 	return b.String()
 }
-
-// silence unused-variable in incremental development.
-var _ iter.Seq2[*session.Event, error]
