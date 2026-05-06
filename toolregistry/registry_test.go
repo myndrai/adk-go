@@ -16,7 +16,10 @@ package toolregistry_test
 
 import (
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"google.golang.org/adk/tool"
 	"google.golang.org/adk/tool/functiontool"
@@ -155,5 +158,77 @@ func TestNames(t *testing.T) {
 	names := r.Names()
 	if len(names) != 2 || names[0] != "x" || names[1] != "y" {
 		t.Errorf("Names = %v, want [x y]", names)
+	}
+}
+
+// TestGet_BuilderInvokedOnceUnderConcurrency locks down review fix #8:
+// 100 concurrent Get calls for a slow Builder must invoke the Builder
+// exactly once (sync.Once gating), and the build must run outside the
+// registry lock so other registry operations don't block on it.
+func TestGet_BuilderInvokedOnceUnderConcurrency(t *testing.T) {
+	r := toolregistry.New()
+
+	var calls atomic.Int32
+	if err := r.Register(toolregistry.Info{Name: "slow"}, func() (tool.Tool, error) {
+		calls.Add(1)
+		// Simulate a slow construction.
+		time.Sleep(50 * time.Millisecond)
+		return mustTool(t, "slow"), nil
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	const N = 100
+	var wg sync.WaitGroup
+	wg.Add(N)
+	results := make([]tool.Tool, N)
+	errs := make([]error, N)
+	for i := 0; i < N; i++ {
+		go func(i int) {
+			defer wg.Done()
+			results[i], errs[i] = r.Get("slow")
+		}(i)
+	}
+	wg.Wait()
+
+	if got := calls.Load(); got != 1 {
+		t.Errorf("Builder invoked %d times, want exactly 1", got)
+	}
+	for i := 0; i < N; i++ {
+		if errs[i] != nil {
+			t.Errorf("Get[%d] err: %v", i, errs[i])
+		}
+		if results[i] == nil || results[i].Name() != "slow" {
+			t.Errorf("Get[%d] = %v, want non-nil with Name=slow", i, results[i])
+		}
+	}
+}
+
+// TestGet_BuilderErrorIsCachedAndReplayed locks down that a failing
+// Builder caches its error so subsequent Gets for the same name see the
+// same error without re-invoking the Builder.
+func TestGet_BuilderErrorIsCachedAndReplayed(t *testing.T) {
+	r := toolregistry.New()
+
+	var calls atomic.Int32
+	wantErr := errors.New("nope")
+	if err := r.Register(toolregistry.Info{Name: "broken"}, func() (tool.Tool, error) {
+		calls.Add(1)
+		return nil, wantErr
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	for i := 0; i < 5; i++ {
+		_, err := r.Get("broken")
+		if err == nil {
+			t.Fatalf("Get[%d] err = nil, want non-nil", i)
+		}
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("Get[%d] err = %v, want wraps %v", i, err, wantErr)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("Builder invoked %d times, want exactly 1 (errors are cached)", got)
 	}
 }
