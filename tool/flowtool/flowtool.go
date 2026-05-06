@@ -213,13 +213,13 @@ func (t *flowTool) Run(toolCtx tool.Context, args any) (map[string]any, error) {
 		return nil, fmt.Errorf("flowtool: expected map[string]any args, got %T", args)
 	}
 
-	parentCtx, ok := toolCtx.(context.Context)
-	if !ok {
-		// tool.Context embeds context.Context indirectly via CallbackContext.
-		// Fall back to background if the type assertion misses; in practice
-		// the runner always supplies a context-bearing toolCtx.
-		parentCtx = context.Background()
-	}
+	// tool.Context embeds context.Context (transitively via
+	// agent.CallbackContext → agent.ReadonlyContext), so the conversion is
+	// always safe. The previous `, ok := toolCtx.(context.Context)`
+	// guard was dead — the type assertion never failed — and its
+	// fallback to context.Background dropped any caller cancellation
+	// silently.
+	parentCtx := context.Context(toolCtx)
 
 	depth := recursionDepth(parentCtx)
 	if t.maxRecursion > 0 && depth >= t.maxRecursion {

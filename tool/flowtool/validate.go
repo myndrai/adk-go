@@ -16,8 +16,8 @@ package flowtool
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"sort"
 
 	"google.golang.org/adk/agent"
 )
@@ -62,6 +62,7 @@ func (t *flowTool) catalogNames() []string {
 	for name := range t.catalog {
 		names = append(names, name)
 	}
+	sort.Strings(names)
 	return names
 }
 
@@ -83,9 +84,6 @@ func recursionDepth(ctx context.Context) int {
 func withRecursion(ctx context.Context, d int) context.Context {
 	return context.WithValue(ctx, recursionKey{}, d)
 }
-
-// errRecursionExceeded is returned when the recursion guard trips.
-var errRecursionExceeded = errors.New("flowtool: recursion depth exceeded")
 
 // resolveAgent returns the agent registered in the catalog for the given
 // name, or an error.

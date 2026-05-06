@@ -107,7 +107,11 @@ func (o *outputs) renderTemplate(s string) (string, error) {
 			return match
 		}
 		if r.Error != "" {
-			return ""
+			// Surface the upstream failure inline rather than substituting
+			// an empty string. Downstream agents otherwise receive a
+			// silently-truncated prompt and can't tell that a predecessor
+			// errored.
+			return fmt.Sprintf("[error from %s: %s]", path, r.Error)
 		}
 		return r.Output
 	})
@@ -176,8 +180,15 @@ func (e *executor) runParallel(ctx context.Context, s *Spec, input string) (stri
 	for i := range s.Nodes {
 		i := i
 		child := &s.Nodes[i]
+		// Acquire the semaphore slot under ctx supervision so a cancelled
+		// parent does not deadlock the loop on a full sem channel.
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			results[i] = result{path: child.Path, err: ctx.Err()}
+			continue
+		}
 		wg.Add(1)
-		sem <- struct{}{}
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
