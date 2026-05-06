@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -126,6 +127,11 @@ func (e *Executor) Execute(ctx context.Context, in codeexec.Input) (<-chan codee
 	if stdinSrc != nil {
 		cmd.Stdin = stdinSrc
 	}
+	// Inherit the host process env and append caller-supplied extras so
+	// PATH, HOME, PYTHONPATH, etc. survive into the subprocess. Replacing
+	// os.Environ() entirely (the previous behavior when in.Env was
+	// non-empty) silently broke common interpreters: python -c without
+	// HOME / PYTHONHOME, bash without PATH, etc.
 	cmd.Env = envFor(in.Env)
 
 	var stdout, stderr bytes.Buffer
@@ -189,11 +195,22 @@ func bytesReader(b []byte) io.Reader {
 	return bytes.NewReader(b)
 }
 
+// envFor returns the subprocess env: os.Environ() inherited from the host
+// process, with the caller-supplied extras appended (extras win for
+// duplicate keys because exec.Cmd resolves duplicates last-write-wins).
+//
+// Returning nil when there are no extras would also inherit os.Environ()
+// (Go's exec semantics treat cmd.Env == nil as "use parent's environ"),
+// but we explicitly build the slice so the behavior is the same in both
+// branches — and so a future caller that adds extras can't accidentally
+// regress to wiping the host env.
 func envFor(extra map[string]string) []string {
+	host := os.Environ()
 	if len(extra) == 0 {
-		return nil
+		return host
 	}
-	out := make([]string, 0, len(extra))
+	out := make([]string, 0, len(host)+len(extra))
+	out = append(out, host...)
 	for k, v := range extra {
 		out = append(out, k+"="+v)
 	}
