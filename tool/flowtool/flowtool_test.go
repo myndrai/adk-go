@@ -370,3 +370,45 @@ func newToolContextAtDepth(t *testing.T, a agent.Agent, depth int) tool.Context 
 	})
 	return toolinternal.NewToolContext(ic, "", &session.EventActions{}, nil)
 }
+
+// TestRenderTemplate_LabelsErroredPredecessor locks down review fix #7:
+// renderTemplate must surface an upstream failure as a labeled
+// `[error from <path>: <msg>]` placeholder instead of silently
+// substituting an empty string and hiding the failure from downstream.
+func TestRenderTemplate_LabelsErroredPredecessor(t *testing.T) {
+	t.Parallel()
+	got, err := flowtool.RenderTemplateForTest(map[string]struct {
+		Output string
+		Error  string
+	}{
+		"seq[0].failing": {Error: "kaboom"},
+	}, "saw: {{nodes.seq[0].failing.output}}")
+	if err != nil {
+		t.Fatalf("RenderTemplateForTest: %v", err)
+	}
+	if !strings.Contains(got, "[error from seq[0].failing") {
+		t.Errorf("expected '[error from seq[0].failing' label, got %q", got)
+	}
+	if !strings.Contains(got, "kaboom") {
+		t.Errorf("expected upstream error message, got %q", got)
+	}
+}
+
+// TestRenderTemplate_HappyPathStillSubstitutesOutput sanity-checks that
+// the success path is unchanged: a successful predecessor's Output is
+// substituted verbatim.
+func TestRenderTemplate_HappyPathStillSubstitutesOutput(t *testing.T) {
+	t.Parallel()
+	got, err := flowtool.RenderTemplateForTest(map[string]struct {
+		Output string
+		Error  string
+	}{
+		"seq[0].first": {Output: "ALPHA"},
+	}, "got: {{nodes.seq[0].first.output}}")
+	if err != nil {
+		t.Fatalf("RenderTemplateForTest: %v", err)
+	}
+	if got != "got: ALPHA" {
+		t.Errorf("got %q, want %q", got, "got: ALPHA")
+	}
+}

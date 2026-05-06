@@ -21,3 +21,16 @@ import "context"
 func WithRecursionDepth(ctx context.Context, depth int) context.Context {
 	return withRecursion(ctx, depth)
 }
+
+// RenderTemplateForTest is exported so unit tests can exercise
+// renderTemplate without driving the full Run path.
+func RenderTemplateForTest(setOutputs map[string]struct {
+	Output string
+	Error  string
+}, template string) (string, error) {
+	o := newOutputs()
+	for path, r := range setOutputs {
+		o.Set(path, nodeResult{Output: r.Output, Error: r.Error})
+	}
+	return o.renderTemplate(template)
+}
