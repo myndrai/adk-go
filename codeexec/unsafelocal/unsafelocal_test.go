@@ -121,3 +121,33 @@ func TestRegistered(t *testing.T) {
 		t.Errorf("Name = %q", exec.Name())
 	}
 }
+
+// TestExecute_InheritsHostEnv locks down review fix #5: the subprocess
+// must inherit the host process's environment (PATH, HOME, PYTHONPATH,
+// …) even when the caller supplies extra env vars. The previous
+// implementation overwrote cmd.Env with only the caller's extras, which
+// broke common interpreters that rely on HOME / PYTHONHOME.
+func TestExecute_InheritsHostEnv(t *testing.T) {
+	if !haveBinary("python3") && !haveBinary("python") {
+		t.Skip("no python interpreter on PATH")
+	}
+	e := &unsafelocal.Executor{MaxRuntime: 5 * time.Second}
+	ch, err := e.Execute(context.Background(), codeexec.Input{
+		Language: "python3",
+		Code:     "import os; print(os.environ.get('PATH', ''))",
+		Env:      map[string]string{"ADK_TEST_EXTRA": "1"},
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	var out string
+	for chunk := range ch {
+		if chunk.Err != nil {
+			t.Fatalf("chunk err: %v (stderr=%q)", chunk.Err, string(chunk.Stderr))
+		}
+		out += string(chunk.Stdout)
+	}
+	if !strings.Contains(out, "/") {
+		t.Errorf("PATH not inherited into subprocess: stdout=%q", out)
+	}
+}
