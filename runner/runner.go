@@ -208,7 +208,13 @@ func (r *Runner) Run(ctx context.Context, userID, sessionID string, msg *genai.C
 	//   see adk-python/src/google/adk/runners.py Runner._new_invocation_context.
 	// TODO: setup tracer.
 	return func(yield func(*session.Event, error) bool) {
-		if msg == nil && !r.isResumable() {
+		// ErrNotResumable applies only to v2-style (App-backed) runners.
+		// v1-style runners (constructed with Config.Agent and no App)
+		// historically accepted msg==nil for replay-from-session test
+		// patterns and other compatibility surfaces; preserve that.
+		// Mirrors adk-python runners.py:884: the ValueError there fires
+		// only when the resumable-app contract is in play.
+		if msg == nil && r.appCfg != nil && !r.isResumable() {
 			yield(nil, ErrNotResumable)
 			return
 		}
