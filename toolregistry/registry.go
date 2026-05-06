@@ -95,8 +95,12 @@ type entry struct {
 	info  Info
 	build Builder
 
-	// cached is the lazily-built tool. Access guarded by registryMu.
-	cached tool.Tool
+	// once gates the lazy build so concurrent Get calls run the Builder
+	// at most once. cached and buildErr are set inside once.Do and read
+	// without holding the registry lock afterward.
+	once     sync.Once
+	cached   tool.Tool
+	buildErr error
 }
 
 // Registry is the central catalog of dynamically-loadable tools.
@@ -142,7 +146,11 @@ func (r *Registry) RegisterTool(t tool.Tool, info Info) error {
 }
 
 // Get returns the tool registered under name. The first call constructs
-// the tool via its Builder; subsequent calls return the cached value.
+// the tool via its Builder; subsequent calls return the cached value
+// (or cached error). The Builder runs outside the registry lock so a
+// slow construction (network call, file read) does not block other
+// registry operations. Concurrent Gets for the same name see exactly
+// one Builder invocation.
 func (r *Registry) Get(name string) (tool.Tool, error) {
 	r.mu.RLock()
 	e, ok := r.entries[name]
@@ -150,17 +158,18 @@ func (r *Registry) Get(name string) (tool.Tool, error) {
 	if !ok {
 		return nil, fmt.Errorf("toolregistry: tool %q not found", name)
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if e.cached != nil {
-		return e.cached, nil
+	e.once.Do(func() {
+		t, err := e.build()
+		if err != nil {
+			e.buildErr = fmt.Errorf("toolregistry: build %q: %w", name, err)
+			return
+		}
+		e.cached = t
+	})
+	if e.buildErr != nil {
+		return nil, e.buildErr
 	}
-	t, err := e.build()
-	if err != nil {
-		return nil, fmt.Errorf("toolregistry: build %q: %w", name, err)
-	}
-	e.cached = t
-	return t, nil
+	return e.cached, nil
 }
 
 // Has reports whether name is registered.
