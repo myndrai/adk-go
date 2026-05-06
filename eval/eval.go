@@ -31,10 +31,6 @@ import (
 	"os"
 	"strings"
 	"time"
-
-	"google.golang.org/genai"
-
-	"google.golang.org/adk/agent"
 )
 
 // Case is one input/expected-output pair to test against an agent.
@@ -222,9 +218,3 @@ func (ContainsScorer) Score(_ context.Context, c Case, output string) (float64, 
 	}
 	return 1.0, "all substrings present", nil
 }
-
-// silence unused-import warnings during incremental builds; placeholder
-// for future agent.Agent / genai.Content integration as the runner
-// adapter lands.
-var _ = agent.RunConfig{}
-var _ = genai.RoleUser
