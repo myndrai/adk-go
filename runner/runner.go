@@ -17,6 +17,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"iter"
 	"log"
@@ -25,10 +26,12 @@ import (
 	"google.golang.org/genai"
 
 	"google.golang.org/adk/agent"
+	"google.golang.org/adk/app"
 	"google.golang.org/adk/artifact"
 	"google.golang.org/adk/internal/agent/parentmap"
 	"google.golang.org/adk/internal/agent/runconfig"
 	artifactinternal "google.golang.org/adk/internal/artifact"
+	"google.golang.org/adk/internal/compaction"
 	icontext "google.golang.org/adk/internal/context"
 	"google.golang.org/adk/internal/llminternal"
 	imemory "google.golang.org/adk/internal/memory"
@@ -41,17 +44,27 @@ import (
 )
 
 // Config is used to create a [Runner].
+//
+// Either Agent (v1 form) or App (v2 form) must be supplied — but not both.
+// When App is set, AppName, Agent, and PluginConfig are read from it; the
+// equivalent top-level fields are then optional and ignored if also set.
 type Config struct {
 	AppName string
-	// Root agent which starts the execution.
+	// Root agent which starts the execution. v1 form. Mutually exclusive
+	// with App. Future Phase 2 will allow workflow.Node here too.
 	Agent          agent.Agent
 	SessionService session.Service
+
+	// App is the v2 container that pairs the root agent with shared plugins
+	// and runtime configurations (event compaction, context cache,
+	// resumability). Mutually exclusive with the top-level Agent field.
+	App *app.App
 
 	// optional
 	ArtifactService artifact.Service
 	// optional
 	MemoryService memory.Service
-	// optional
+	// optional. Ignored when App is set; use App.Plugins instead.
 	PluginConfig PluginConfig
 	// optional
 	AutoCreateSession bool
@@ -76,8 +89,32 @@ func WithStateDelta(delta map[string]any) RunOption {
 }
 
 // New creates a new [Runner].
+//
+// Accepts both v1-style (Config.Agent + Config.PluginConfig) and v2-style
+// (Config.App) construction. When Config.App is set, it takes precedence
+// over the v1 fields except for SessionService and ArtifactService /
+// MemoryService, which always come from Config.
 func New(cfg Config) (*Runner, error) {
-	if cfg.Agent == nil {
+	if cfg.App != nil && cfg.Agent != nil {
+		return nil, errors.New("runner: set either Config.Agent or Config.App, not both")
+	}
+
+	rootAgent := cfg.Agent
+	appName := cfg.AppName
+	plugins := cfg.PluginConfig.Plugins
+	closeTimeout := cfg.PluginConfig.CloseTimeout
+
+	if cfg.App != nil {
+		rootAgent = cfg.App.RootAgent
+		if appName == "" {
+			appName = cfg.App.Name
+		}
+		plugins = cfg.App.Plugins
+		// closeTimeout stays from PluginConfig if caller supplied it
+		// alongside the App; App itself doesn't model a timeout today.
+	}
+
+	if rootAgent == nil {
 		return nil, fmt.Errorf("root agent is required")
 	}
 
@@ -85,28 +122,29 @@ func New(cfg Config) (*Runner, error) {
 		return nil, fmt.Errorf("session service is required")
 	}
 
-	parents, err := parentmap.New(cfg.Agent)
+	parents, err := parentmap.New(rootAgent)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create agent tree: %w", err)
 	}
 
 	pluginManager, err := plugininternal.NewPluginManager(plugininternal.PluginConfig{
-		Plugins:      cfg.PluginConfig.Plugins,
-		CloseTimeout: cfg.PluginConfig.CloseTimeout,
+		Plugins:      plugins,
+		CloseTimeout: closeTimeout,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create plugin manager: %w", err)
 	}
 
 	return &Runner{
-		appName:           cfg.AppName,
-		rootAgent:         cfg.Agent,
+		appName:           appName,
+		rootAgent:         rootAgent,
 		sessionService:    cfg.SessionService,
 		artifactService:   cfg.ArtifactService,
 		memoryService:     cfg.MemoryService,
 		parents:           parents,
 		pluginManager:     pluginManager,
 		autoCreateSession: cfg.AutoCreateSession,
+		appCfg:            cfg.App,
 	}, nil
 }
 
@@ -123,16 +161,63 @@ type Runner struct {
 	parents           parentmap.Map
 	pluginManager     *plugininternal.PluginManager
 	autoCreateSession bool
+
+	// appCfg is set when Runner was constructed via Config.App. It carries
+	// app-level configuration (event compaction, context cache, resumability)
+	// to runtime hooks introduced in later Phase 1 tracks.
+	appCfg *app.App
+}
+
+// ErrNotResumable is returned by Run/Resume when no new message is provided
+// and the runner's App does not have ResumabilityConfig.IsResumable set.
+// Mirrors adk-python runners.py:884.
+var ErrNotResumable = errors.New("runner: running an agent requires a new_message or a resumable app")
+
+// Resume re-enters an existing session without appending a new user message.
+// The root agent gets a chance to rehydrate from prior session events and
+// continue from the first non-completed point. Resume only succeeds when the
+// runner was constructed via Config.App with ResumabilityConfig.IsResumable
+// set; otherwise it yields ErrNotResumable.
+//
+// In this foundation PR Resume is the API surface only — the actual workflow
+// rehydration semantics arrive with the workflow package in a later PR.
+func (r *Runner) Resume(ctx context.Context, userID, sessionID string, cfg agent.RunConfig, opts ...RunOption) iter.Seq2[*session.Event, error] {
+	if !r.isResumable() {
+		return func(yield func(*session.Event, error) bool) {
+			yield(nil, ErrNotResumable)
+		}
+	}
+	return r.Run(ctx, userID, sessionID, nil, cfg, opts...)
+}
+
+// isResumable reports whether the runner's App is configured to permit
+// resume invocations (msg=nil).
+func (r *Runner) isResumable() bool {
+	return r.appCfg != nil && r.appCfg.ResumabilityConfig != nil && r.appCfg.ResumabilityConfig.IsResumable
 }
 
 // Run runs the agent for the given user input, yielding events from agents.
 // For each user message it finds the proper agent within an agent tree to
 // continue the conversation within the session.
+//
+// Calling Run with msg == nil is only valid when the runner was constructed
+// from an App whose ResumabilityConfig.IsResumable is true. Otherwise Run
+// yields ErrNotResumable. Mirrors adk-python runners.py:884.
 func (r *Runner) Run(ctx context.Context, userID, sessionID string, msg *genai.Content, cfg agent.RunConfig, opts ...RunOption) iter.Seq2[*session.Event, error] {
 	// TODO(hakim): we need to validate whether cfg is compatible with the Agent.
 	//   see adk-python/src/google/adk/runners.py Runner._new_invocation_context.
 	// TODO: setup tracer.
 	return func(yield func(*session.Event, error) bool) {
+		// ErrNotResumable applies only to v2-style (App-backed) runners.
+		// v1-style runners (constructed with Config.Agent and no App)
+		// historically accepted msg==nil for replay-from-session test
+		// patterns and other compatibility surfaces; preserve that.
+		// Mirrors adk-python runners.py:884: the ValueError there fires
+		// only when the resumable-app contract is in play.
+		if msg == nil && r.appCfg != nil && !r.isResumable() {
+			yield(nil, ErrNotResumable)
+			return
+		}
 		options := runOptions{}
 		for _, opt := range opts {
 			opt(&options)
@@ -217,16 +302,27 @@ func (r *Runner) Run(ctx context.Context, userID, sessionID string, msg *genai.C
 
 			earlyExitResult, err := pluginManager.RunBeforeRunCallback(ctx)
 			if earlyExitResult != nil || err != nil {
-				earlyExitEvent := session.NewEvent(ctx.InvocationID())
-				earlyExitEvent.Author = "user"
-				earlyExitEvent.LLMResponse = model.LLMResponse{
-					Content: msg,
-				}
-				if err := r.sessionService.AppendEvent(ctx, storedSession, earlyExitEvent); err != nil {
-					yield(nil, fmt.Errorf("failed to add event to session: %w", err))
+				// The user message has already been appended to the session by
+				// appendMessageToSession above. Don't append a second user-authored
+				// duplicate here. When the BeforeRun plugin produced an
+				// early-exit content, surface it as an agent-authored event;
+				// when it only returned an error, surface the error alone.
+				// Mirrors adk-python runners.py:1166-1180.
+				if earlyExitResult != nil {
+					earlyExitEvent := session.NewEvent(ctx.InvocationID())
+					earlyExitEvent.Author = agentToRun.Name()
+					earlyExitEvent.Branch = ctx.Branch()
+					earlyExitEvent.LLMResponse = model.LLMResponse{
+						Content: earlyExitResult,
+					}
+					if appendErr := r.sessionService.AppendEvent(ctx, storedSession, earlyExitEvent); appendErr != nil {
+						yield(nil, fmt.Errorf("failed to add event to session: %w", appendErr))
+						return
+					}
+					yield(earlyExitEvent, err)
 					return
 				}
-				yield(earlyExitEvent, err)
+				yield(nil, err)
 				return
 			}
 		}
@@ -264,7 +360,37 @@ func (r *Runner) Run(ctx context.Context, userID, sessionID string, msg *genai.C
 				return
 			}
 		}
+
+		// Post-invocation compaction (Phase 1E). Runs only when an App with
+		// EventsCompactionConfig was supplied. Failures are logged but do not
+		// abort the invocation since compaction is best-effort.
+		if cc := r.compactionConfig(); cc != nil {
+			if _, err := compaction.MaybeRun(ctx, compaction.MaybeRunInput{
+				Summarizer:         cc.Summarizer,
+				CompactionInterval: cc.CompactionInterval,
+				OverlapSize:        cc.OverlapSize,
+				TokenThreshold:     cc.TokenThreshold,
+				EventRetentionSize: cc.EventRetentionSize,
+				Session:            storedSession,
+				SessionService:     r.sessionService,
+				AppName:            r.appName,
+				UserID:             storedSession.UserID(),
+				SessionID:          storedSession.ID(),
+				CurrentBranch:      ctx.Branch(),
+				AgentName:          agentToRun.Name(),
+			}); err != nil {
+				log.Printf("compaction error (non-fatal): %v", err)
+			}
+		}
 	}
+}
+
+// compactionConfig returns the App's EventsCompactionConfig, or nil if none.
+func (r *Runner) compactionConfig() *app.EventsCompactionConfig {
+	if r.appCfg == nil {
+		return nil
+	}
+	return r.appCfg.EventsCompactionConfig
 }
 
 func (r *Runner) appendMessageToSession(ctx agent.InvocationContext, storedSession session.Session, msg *genai.Content, saveInputBlobsAsArtifacts bool, pluginManager *plugininternal.PluginManager, stateDelta map[string]any) (agent.InvocationContext, error) {
