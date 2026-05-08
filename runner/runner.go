@@ -174,13 +174,15 @@ type Runner struct {
 var ErrNotResumable = errors.New("runner: running an agent requires a new_message or a resumable app")
 
 // Resume re-enters an existing session without appending a new user message.
-// The root agent gets a chance to rehydrate from prior session events and
-// continue from the first non-completed point. Resume only succeeds when the
-// runner was constructed via Config.App with ResumabilityConfig.IsResumable
-// set; otherwise it yields ErrNotResumable.
+// The root agent (typically a workflow) gets a chance to rehydrate from prior
+// session events and continue from the first non-completed point. Resume only
+// succeeds when the runner was constructed via Config.App with
+// ResumabilityConfig.IsResumable set; otherwise it yields ErrNotResumable.
 //
-// In this foundation PR Resume is the API surface only — the actual workflow
-// rehydration semantics arrive with the workflow package in a later PR.
+// Workflow agents skip already-completed direct children based on session
+// events whose Actions.NodeInfo.Output is set. WAITING nodes (HITL
+// interrupts) and dynamic-node rehydration are handled by the workflow
+// orchestrator's lazy-scan rehydrate path.
 func (r *Runner) Resume(ctx context.Context, userID, sessionID string, cfg agent.RunConfig, opts ...RunOption) iter.Seq2[*session.Event, error] {
 	if !r.isResumable() {
 		return func(yield func(*session.Event, error) bool) {
