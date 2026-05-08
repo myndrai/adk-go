@@ -65,4 +65,13 @@ type LLMResponse struct {
 	ErrorMessage            string
 	FinishReason            genai.FinishReason
 	AvgLogprobs             float64
+	// CachedInputTokens reports input tokens served from the provider's
+	// prompt cache (Anthropic cache_read_input_tokens). Zero on providers
+	// that do not surface a cache-read counter.
+	CachedInputTokens int64
+	// CacheCreationTokens reports input tokens written to the provider's
+	// prompt cache during this request (Anthropic
+	// cache_creation_input_tokens). Zero on providers that do not surface
+	// a cache-write counter.
+	CacheCreationTokens int64
 }
