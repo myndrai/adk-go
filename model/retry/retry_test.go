@@ -23,8 +23,9 @@ import (
 	"testing"
 	"time"
 
-	"google.golang.org/adk/model"
 	"google.golang.org/genai"
+
+	"google.golang.org/adk/model"
 )
 
 type fakeLLM struct {
@@ -57,7 +58,7 @@ func (f *fakeLLM) GenerateContent(ctx context.Context, req *model.LLMRequest, st
 	}
 }
 
-func mustErr(t *testing.T, want error, got error) {
+func mustErr(t *testing.T, want, got error) {
 	t.Helper()
 	if !errors.Is(got, want) {
 		t.Fatalf("err = %v, want errors.Is %v", got, want)
