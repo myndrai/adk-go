@@ -128,8 +128,8 @@ func TestMaybeRun_SlidingWindow_Triggers(t *testing.T) {
 		Summarizer:         sum,
 		CompactionInterval: 2,
 		OverlapSize:        0,
-		Session:        cr.Session,
-		SessionService: srv,
+		Session:            cr.Session,
+		SessionService:     srv,
 	})
 	if err != nil {
 		t.Fatalf("err = %v", err)
@@ -163,11 +163,11 @@ func TestMaybeRun_SlidingWindow_NotEnoughInvocations(t *testing.T) {
 	}
 	sum := &fakeSummarizer{output: "summary"}
 	got, _ := MaybeRun(context.Background(), MaybeRunInput{
-					Summarizer:         sum,
-			CompactionInterval: 5, // require 5, only have 1
-			OverlapSize:        0,
-		Session:        cr.Session,
-		SessionService: srv,
+		Summarizer:         sum,
+		CompactionInterval: 5, // require 5, only have 1
+		OverlapSize:        0,
+		Session:            cr.Session,
+		SessionService:     srv,
 	})
 	if got {
 		t.Error("expected no compaction")
@@ -199,13 +199,13 @@ func TestMaybeRun_TokenThreshold_FiresWhenAboveLimit(t *testing.T) {
 	ret := 2
 	sum := &fakeSummarizer{output: "summary"}
 	got, err := MaybeRun(context.Background(), MaybeRunInput{
-					Summarizer:         sum,
-			CompactionInterval: 99, // sliding wouldn't trigger
-			OverlapSize:        0,
-			TokenThreshold:     &thr,
-			EventRetentionSize: &ret,
-		Session:        cr.Session,
-		SessionService: srv,
+		Summarizer:         sum,
+		CompactionInterval: 99, // sliding wouldn't trigger
+		OverlapSize:        0,
+		TokenThreshold:     &thr,
+		EventRetentionSize: &ret,
+		Session:            cr.Session,
+		SessionService:     srv,
 	})
 	if err != nil {
 		t.Fatalf("err = %v", err)
@@ -236,13 +236,13 @@ func TestMaybeRun_TokenThreshold_BelowLimit(t *testing.T) {
 	ret := 1
 	sum := &fakeSummarizer{output: "summary"}
 	got, _ := MaybeRun(context.Background(), MaybeRunInput{
-					Summarizer:         sum,
-			CompactionInterval: 99,
-			OverlapSize:        0,
-			TokenThreshold:     &thr,
-			EventRetentionSize: &ret,
-		Session:        cr.Session,
-		SessionService: srv,
+		Summarizer:         sum,
+		CompactionInterval: 99,
+		OverlapSize:        0,
+		TokenThreshold:     &thr,
+		EventRetentionSize: &ret,
+		Session:            cr.Session,
+		SessionService:     srv,
 	})
 	if got || sum.calls != 0 {
 		t.Errorf("expected no compaction, got %v with %d summarizer calls", got, sum.calls)
@@ -267,8 +267,8 @@ func TestMaybeRun_SummarizerReturnsNil_NoAppend(t *testing.T) {
 		Summarizer:         sum,
 		CompactionInterval: 2,
 		OverlapSize:        0,
-		Session:        cr.Session,
-		SessionService: srv,
+		Session:            cr.Session,
+		SessionService:     srv,
 	})
 	if got {
 		t.Error("expected no compaction (summarizer returned nil)")
