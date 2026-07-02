@@ -71,6 +71,10 @@ func (s *LlmEventSummarizer) MaybeSummarize(ctx context.Context, events []*sessi
 	}
 	conv := formatEventsForSummary(events)
 	if conv == "" {
+		// A window with no text content (e.g. only tool traffic) yields no
+		// compaction event, so the compaction cursor does not advance and
+		// the same window is re-evaluated on the next invocation. Mirrors
+		// adk-python; cheap because no LLM call is made on this path.
 		return nil, nil
 	}
 	prompt := strings.ReplaceAll(s.promptTemplate, "{conversation_history}", conv)

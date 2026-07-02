@@ -17,6 +17,7 @@ package retry
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"iter"
 	"sync/atomic"
@@ -176,9 +177,13 @@ func TestRetry_ContextCanceled_StopsImmediately(t *testing.T) {
 	cancel() // cancel immediately
 	_, errs := collect(wrapped.GenerateContent(ctx, &model.LLMRequest{}, false))
 	// Either the very first sleep fails to context, or shouldRetry returns
-	// false because ctx is canceled. Both are correct stopping paths.
+	// false because ctx is canceled and yields the last model error. Both
+	// are correct stopping paths — but nothing else is.
 	if errs[0] == nil {
 		t.Fatal("expected error after canceled ctx")
+	}
+	if !errors.Is(errs[0], context.Canceled) && !errors.Is(errs[0], transient) {
+		t.Fatalf("terminal error = %v; want context.Canceled or the transient model error", errs[0])
 	}
 }
 
@@ -229,6 +234,14 @@ func TestIsTransient(t *testing.T) {
 		{"connection reset", errors.New("read tcp: connection reset by peer"), true},
 		{"plain error", errors.New("invalid argument"), false},
 		{"too many requests", errors.New("HTTP 429: too many requests"), true},
+		// Wrapped errors must be classified via errors.As, not only the
+		// string-sniff fallback.
+		{"wrapped 503", fmt.Errorf("calling model: %w", genai.APIError{Code: 503}), true},
+		{"wrapped 400", fmt.Errorf("calling model: %w", genai.APIError{Code: 400}), false},
+		// Typed net.Error branch: timeout is transient, non-timeout is not.
+		{"net timeout", fakeNetError{timeout: true}, true},
+		{"net non-timeout", fakeNetError{timeout: false}, false},
+		{"wrapped net timeout", fmt.Errorf("dial: %w", fakeNetError{timeout: true}), true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -239,6 +252,15 @@ func TestIsTransient(t *testing.T) {
 	}
 	_ = mustErr
 }
+
+// fakeNetError implements net.Error with a controllable Timeout result,
+// exercising IsTransient's typed net.Error branch. The message avoids the
+// string-sniffed keywords so only the typed branch can classify it.
+type fakeNetError struct{ timeout bool }
+
+func (e fakeNetError) Error() string   { return "synthetic network failure" }
+func (e fakeNetError) Timeout() bool   { return e.timeout }
+func (e fakeNetError) Temporary() bool { return false }
 
 // TestDelayFor_RespectsMaxDelay locks down review fix #11: jitter is applied
 // after the MaxDelay clamp, but the post-jitter delay is re-clamped so the

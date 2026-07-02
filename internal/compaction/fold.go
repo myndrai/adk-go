@@ -47,6 +47,12 @@ import (
 // The contents-builder calls this before assembling LLM contents from
 // session events, so the model sees a single compacted turn instead of the
 // raw older history.
+//
+// Fold assumes event timestamps are strictly increasing: the cut keeps only
+// events strictly after compaction.EndTimestamp, so an unscoped retained
+// event sharing that exact instant is folded away with the compacted span.
+// Unreachable with wall-clock time.Now() stamps; reachable with coarse or
+// injected clocks (platform seams) that can stamp two events identically.
 func Fold(events []*session.Event) []*session.Event {
 	latest := latestCompactionEvent(events)
 	if latest == nil || latest.Actions.Compaction == nil {
