@@ -52,17 +52,21 @@ type Config struct {
 }
 
 // Validate reports whether the config is usable. Mirrors the v1 fork's
-// app.EventsCompactionConfig.validate, relaxed so the sliding-window and
-// token-threshold triggers can each be configured independently (matching
-// internal/compaction.MaybeRunInput.hasAnyTrigger).
+// app.EventsCompactionConfig.validate. The sliding-window and token-threshold
+// triggers can each be configured independently; however, TokenThreshold and
+// EventRetentionSize must be set together (one cannot be set without the other).
 func (c Config) Validate() error {
 	if c.Summarizer == nil {
 		return errors.New("compaction: Summarizer is required")
 	}
 	hasWindow := c.CompactionInterval != 0
 	hasToken := c.TokenThreshold != nil
+	hasRetention := c.EventRetentionSize != nil
 	if !hasWindow && !hasToken {
 		return errors.New("compaction: configure CompactionInterval and/or TokenThreshold")
+	}
+	if (c.TokenThreshold == nil) != (c.EventRetentionSize == nil) {
+		return errors.New("compaction: TokenThreshold and EventRetentionSize must be set together")
 	}
 	if c.CompactionInterval < 0 {
 		return fmt.Errorf("compaction: CompactionInterval must be >= 0, got %d", c.CompactionInterval)
@@ -76,7 +80,7 @@ func (c Config) Validate() error {
 	if hasToken && *c.TokenThreshold <= 0 {
 		return fmt.Errorf("compaction: TokenThreshold must be > 0, got %d", *c.TokenThreshold)
 	}
-	if c.EventRetentionSize != nil && *c.EventRetentionSize <= 0 {
+	if hasRetention && *c.EventRetentionSize <= 0 {
 		return fmt.Errorf("compaction: EventRetentionSize must be > 0, got %d", *c.EventRetentionSize)
 	}
 	return nil

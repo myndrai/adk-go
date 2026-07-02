@@ -39,6 +39,9 @@ func TestConfigValidate(t *testing.T) {
 		{"overlap >= interval", Config{Summarizer: nopSummarizer{}, CompactionInterval: 5, OverlapSize: 5}, true},
 		{"negative interval", Config{Summarizer: nopSummarizer{}, CompactionInterval: -1}, true},
 		{"token threshold ok", Config{Summarizer: nopSummarizer{}, TokenThreshold: ptr(4096), EventRetentionSize: ptr(6)}, false},
+		{"token threshold set without retention", Config{Summarizer: nopSummarizer{}, TokenThreshold: ptr(4096)}, true},
+		{"retention set without token threshold", Config{Summarizer: nopSummarizer{}, EventRetentionSize: ptr(6)}, true},
+		{"retention set without token threshold but window configured", Config{Summarizer: nopSummarizer{}, CompactionInterval: 10, EventRetentionSize: ptr(6)}, true},
 	}
 	for _, tc := range tt {
 		t.Run(tc.name, func(t *testing.T) {
