@@ -38,17 +38,19 @@ import (
 	"google.golang.org/adk/v2/session"
 )
 
-// Summarizer is the contract MaybeRun calls into. The app package defines
-// EventsSummarizer with the same shape; passing one as the other is a
-// straight assignment because Go interfaces are structural.
+// Summarizer is the contract MaybeRun calls into. The public compaction
+// package's Summarizer type has the same shape (it is a type alias of this
+// one); passing one as the other is a straight assignment because Go
+// interfaces are structural.
 type Summarizer interface {
 	MaybeSummarize(ctx context.Context, events []*session.Event) (*session.Event, error)
 }
 
-// MaybeRunInput carries the runtime data MaybeRun needs. Fields mirror
-// app.EventsCompactionConfig but are accepted as primitives so this
-// internal package doesn't need to import app (which would create an import
-// cycle: app → plugin → llmagent → llminternal → compaction).
+// MaybeRunInput carries the runtime data MaybeRun needs. Fields mirror the
+// public compaction.Config but are accepted as primitives (rather than by
+// importing that package's Config type) so this internal package stays
+// importable from internal/llminternal without pulling in the public
+// compaction package's own dependency, plugin.
 type MaybeRunInput struct {
 	Summarizer         Summarizer
 	CompactionInterval int
@@ -123,6 +125,18 @@ func (in MaybeRunInput) hasSlidingWindowConfig() bool {
 
 // collectEvents pulls events out of the session into a slice for indexed
 // scanning. Cheap; avoids re-iterating the iterator.
+//
+// Events with a non-empty IsolationScope are excluded: compaction is an
+// unscoped, cross-agent concept (it summarizes into a plain, unscoped
+// compaction event), while isolation scope is an exact-match visibility
+// filter enforced when contents are built for a given agent (see
+// internal/llminternal/contents_processor.go). Folding a scoped agent's
+// events into an unscoped summary would leak that agent's content into
+// every other agent's context, and the timestamp-based cut in Fold would
+// then hide the scoped agent's own raw history from itself. Excluding
+// scoped events here keeps them out of the summarizer input and out of the
+// interval/threshold accounting entirely; Fold independently guarantees
+// they pass through unfolded (see fold.go).
 func collectEvents(sess session.Session) []*session.Event {
 	if sess == nil {
 		return nil
@@ -133,6 +147,9 @@ func collectEvents(sess session.Session) []*session.Event {
 	}
 	out := make([]*session.Event, 0, evs.Len())
 	for e := range evs.All() {
+		if e.IsolationScope != "" {
+			continue
+		}
 		out = append(out, e)
 	}
 	return out

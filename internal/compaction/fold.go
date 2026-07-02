@@ -29,10 +29,20 @@ import (
 //  3. Returns a slice that contains: a synthetic event carrying the
 //     compaction's summary content (Author "model", Timestamp =
 //     compaction.StartTimestamp), followed by every event whose Timestamp
-//     is strictly after compaction.EndTimestamp.
+//     is strictly after compaction.EndTimestamp, in original order.
 //
 // Events with Actions.Compaction set are dropped from the output (the
 // summary supersedes them).
+//
+// Isolation-scoped events (non-empty IsolationScope) are never folded away:
+// compaction summaries are unscoped (see collectEvents in compaction.go),
+// so an isolation-scoped event's content never entered the summary that
+// backs this fold. Cutting a scoped event out here via the timestamp
+// comparison would silently erase a scoped agent's own history even though
+// its content isn't recoverable from the summary. Scoped events therefore
+// always survive folding, regardless of their position relative to
+// compaction.EndTimestamp, and keep their original relative order among
+// themselves and with the seed/retained tail.
 //
 // The contents-builder calls this before assembling LLM contents from
 // session events, so the model sees a single compacted turn instead of the
@@ -59,12 +69,14 @@ func Fold(events []*session.Event) []*session.Event {
 	out = append(out, seed)
 
 	// Pass through events strictly newer than the compaction's end timestamp,
-	// dropping any compaction-marker events themselves.
+	// dropping any compaction-marker events themselves. Isolation-scoped
+	// events always pass through untouched, regardless of timestamp, since
+	// they were never part of the compaction window in the first place.
 	for _, ev := range events {
 		if ev.Actions.Compaction != nil {
 			continue
 		}
-		if ev.Timestamp.After(end) {
+		if ev.IsolationScope != "" || ev.Timestamp.After(end) {
 			out = append(out, ev)
 		}
 	}

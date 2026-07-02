@@ -383,3 +383,160 @@ func TestFold_LatestCompactionReplacesOlderEvents(t *testing.T) {
 		t.Errorf("newer events out of order: %v %v", out[1].Author, out[2].Author)
 	}
 }
+
+// makeScopedUserEvent builds a user event tagged with an isolation scope,
+// mirroring makeUserEvent.
+func makeScopedUserEvent(invID, text, scope string, ts time.Time) *session.Event {
+	e := makeUserEvent(invID, text, ts)
+	e.IsolationScope = scope
+	return e
+}
+
+// TestMaybeRun_SlidingWindow_IsolationScopedEventsExcluded verifies that an
+// isolation-scoped event inside the sliding-compaction window is (a) never
+// forwarded to the Summarizer and (b) doesn't count toward the
+// CompactionInterval invocation tally, so a scoped agent's turns can't
+// silently trigger compaction of (or leak into) another agent's summary.
+func TestMaybeRun_SlidingWindow_IsolationScopedEventsExcluded(t *testing.T) {
+	t0 := time.Unix(100, 0)
+	events := []*session.Event{
+		makeUserEvent("inv-1", "u1", t0),
+		makeModelEvent("inv-1", "m1", t0.Add(time.Second)),
+		// Scoped invocation: must not count toward CompactionInterval, and
+		// must never reach the summarizer.
+		makeScopedUserEvent("inv-scoped", "secret task input", "task-1", t0.Add(2*time.Second)),
+		makeUserEvent("inv-2", "u2", t0.Add(3*time.Second)),
+		makeModelEvent("inv-2", "m2", t0.Add(4*time.Second)),
+	}
+	srv := session.InMemoryService()
+	cr, _ := srv.Create(context.Background(), &session.CreateRequest{AppName: "a", UserID: "u", SessionID: "s"})
+	for _, e := range events {
+		_ = srv.AppendEvent(context.Background(), cr.Session, e)
+	}
+	sum := &fakeSummarizer{output: "summary"}
+	// CompactionInterval requires 2 new invocations. Only inv-1 and inv-2
+	// are unscoped; inv-scoped must not count as a third.
+	got, err := MaybeRun(context.Background(), MaybeRunInput{
+		Summarizer:         sum,
+		CompactionInterval: 2,
+		OverlapSize:        0,
+		Session:            cr.Session,
+		SessionService:     srv,
+	})
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if !got {
+		t.Fatal("expected sliding-window to trigger on the 2 unscoped invocations")
+	}
+	if sum.calls != 1 {
+		t.Fatalf("summarizer calls = %d, want 1", sum.calls)
+	}
+	for _, ev := range sum.gotInput[0] {
+		if ev.IsolationScope != "" {
+			t.Errorf("summarizer input contained scoped event %q (scope %q); scoped events must never reach the summarizer", ev.InvocationID, ev.IsolationScope)
+		}
+	}
+	if n := len(sum.gotInput[0]); n != 4 {
+		t.Errorf("summarized %d events, want 4 (inv-1 + inv-2 only, scoped event excluded)", n)
+	}
+}
+
+// TestMaybeRun_TokenThreshold_IsolationScopedEventsExcluded mirrors the
+// sliding-window regression test for the token-threshold trigger: a scoped
+// event must not be summarized and must not count toward retention/split
+// accounting.
+func TestMaybeRun_TokenThreshold_IsolationScopedEventsExcluded(t *testing.T) {
+	t0 := time.Unix(100, 0)
+	events := []*session.Event{
+		makeUserEvent("inv-1", "long-message-1", t0),
+		makeModelEvent("inv-1", "long-response-1", t0.Add(time.Second)),
+		makeScopedUserEvent("inv-scoped", "secret task input", "task-1", t0.Add(2*time.Second)),
+		makeUserEvent("inv-2", "long-message-2", t0.Add(3*time.Second)),
+		makeModelEvent("inv-2", "long-response-2", t0.Add(4*time.Second)),
+	}
+	events[4].UsageMetadata = &genai.GenerateContentResponseUsageMetadata{PromptTokenCount: 1000}
+
+	srv := session.InMemoryService()
+	cr, _ := srv.Create(context.Background(), &session.CreateRequest{AppName: "a", UserID: "u", SessionID: "s"})
+	for _, e := range events {
+		_ = srv.AppendEvent(context.Background(), cr.Session, e)
+	}
+	thr := 500
+	ret := 1
+	sum := &fakeSummarizer{output: "summary"}
+	got, err := MaybeRun(context.Background(), MaybeRunInput{
+		Summarizer:         sum,
+		CompactionInterval: 99, // sliding wouldn't trigger
+		OverlapSize:        0,
+		TokenThreshold:     &thr,
+		EventRetentionSize: &ret,
+		Session:            cr.Session,
+		SessionService:     srv,
+	})
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if !got {
+		t.Fatal("expected token-threshold to trigger")
+	}
+	for _, ev := range sum.gotInput[0] {
+		if ev.IsolationScope != "" {
+			t.Errorf("summarizer input contained scoped event %q; scoped events must never reach the summarizer", ev.InvocationID)
+		}
+	}
+}
+
+// TestFold_IsolationScopedEventOlderThanCompaction_SurvivesFolding verifies
+// that a scoped event whose timestamp is before (or within) the compaction
+// window's EndTimestamp is not cut by the timestamp-based fold: since scoped
+// events are excluded from collectEvents (and therefore never summarized),
+// dropping them here on a stale timestamp check would erase history that
+// isn't recoverable from the summary. It also checks that the relative
+// order of the seed, the scoped event, and the retained tail is preserved.
+func TestFold_IsolationScopedEventOlderThanCompaction_SurvivesFolding(t *testing.T) {
+	t0 := time.Unix(100, 0)
+	older := []*session.Event{
+		makeUserEvent("inv-1", "u1", t0),
+		makeModelEvent("inv-1", "m1", t0.Add(time.Second)),
+	}
+	// Scoped event sits chronologically inside the compacted span, but must
+	// survive because it was never part of what got summarized.
+	scoped := makeScopedUserEvent("inv-scoped", "secret task input", "task-1", t0.Add(time.Second+500*time.Millisecond))
+	comp := session.NewEvent(context.Background(), "comp-1")
+	comp.Author = "user"
+	comp.Timestamp = t0.Add(2 * time.Second)
+	comp.Actions.Compaction = &session.EventCompaction{
+		StartTimestamp:   t0,
+		EndTimestamp:     t0.Add(time.Second),
+		CompactedContent: &genai.Content{Role: "model", Parts: []*genai.Part{{Text: "summary"}}},
+	}
+	newer := []*session.Event{
+		makeUserEvent("inv-2", "u2", t0.Add(3*time.Second)),
+		makeModelEvent("inv-2", "m2", t0.Add(4*time.Second)),
+	}
+	in := append(append(older, scoped, comp), newer...)
+	out := Fold(in)
+
+	// Expect: 1 synthetic seed + scoped event + 2 newer events = 4.
+	if len(out) != 4 {
+		t.Fatalf("Fold = %d events, want 4 (seed, scoped, 2 newer); got %+v", len(out), out)
+	}
+	if out[0].Content == nil || out[0].Content.Parts[0].Text != "summary" {
+		t.Errorf("first event = %+v, want summary seed", out[0])
+	}
+	// Relative order of survivors (scoped event, then retained tail) must
+	// match their original relative order.
+	if out[1].InvocationID != "inv-scoped" {
+		t.Errorf("out[1].InvocationID = %q, want inv-scoped", out[1].InvocationID)
+	}
+	if out[1].IsolationScope != "task-1" {
+		t.Errorf("scoped event lost its IsolationScope after folding: %q", out[1].IsolationScope)
+	}
+	if out[2].InvocationID != "inv-2" || out[2].Author != "user" {
+		t.Errorf("out[2] = %+v, want inv-2 user event", out[2])
+	}
+	if out[3].InvocationID != "inv-2" || out[3].Author != "model" {
+		t.Errorf("out[3] = %+v, want inv-2 model event", out[3])
+	}
+}

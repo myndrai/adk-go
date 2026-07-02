@@ -17,6 +17,26 @@
 // compaction event, and internal/compaction.Fold substitutes the summary
 // when history is rebuilt for the model. Myndr fork extension; upstream
 // v2 has no equivalent.
+//
+// Session-backend requirement: compaction relies on the session service
+// persisting Event.Actions.Compaction verbatim across reloads. The
+// in-memory and database (session/database) services round-trip
+// EventActions in full and are safe to use with compaction. The VertexAI
+// session service (session/vertexai) maps only StateDelta into its
+// persisted EventActions representation and drops Compaction, so after a
+// reload the compaction history is lost: MaybeRun re-summarizes the entire
+// event history on every subsequent turn (a cost leak) and Fold never
+// folds because no persisted compaction event survives to be found. Do not
+// enable compaction against a VertexAI-backed session service.
+//
+// Isolation-scope interaction: events carrying a non-empty
+// session.Event.IsolationScope (see internal/llminternal's exact-match
+// scope filtering) are excluded from compaction entirely. They are never
+// included in a compaction window or passed to the Summarizer, and
+// internal/compaction.Fold always lets them pass through unfolded — a
+// scoped agent's raw history is preserved as-is rather than being
+// summarized into (and thereby leaked into) another agent's unscoped
+// compaction summary.
 package compaction
 
 import (
