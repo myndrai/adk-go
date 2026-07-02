@@ -25,6 +25,7 @@ import (
 	"google.golang.org/adk/v2/model"
 	"google.golang.org/adk/v2/platform"
 	"google.golang.org/adk/v2/tool/toolconfirmation"
+	"google.golang.org/genai"
 )
 
 // Session represents a series of interactions between a user and agents.
@@ -250,6 +251,23 @@ type EventActions struct {
 	TransferToAgent string
 	// The agent is escalating to a higher level agent.
 	Escalate bool
+	// Compaction, when set, marks this event as a compaction event that
+	// summarizes older history. Myndr fork extension.
+	Compaction *EventCompaction
+}
+
+// EventCompaction summarizes a contiguous span of earlier events. An event
+// carrying a non-nil Compaction replaces the events between StartTimestamp
+// and EndTimestamp when history is rebuilt for the model (see
+// internal/compaction.Fold). This is a myndr fork extension; upstream v2
+// has no event-compaction subsystem.
+type EventCompaction struct {
+	// StartTimestamp is the timestamp of the earliest event covered.
+	StartTimestamp time.Time
+	// EndTimestamp is the timestamp of the latest event covered.
+	EndTimestamp time.Time
+	// CompactedContent is the summarized replacement content.
+	CompactedContent *genai.Content
 }
 
 // Prefixes for defining session's state scopes
