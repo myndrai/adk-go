@@ -36,6 +36,12 @@ type streamingResponseAggregator struct {
 	citationMetadata  *genai.CitationMetadata
 	response          *model.LLMResponse
 
+	// Prompt-cache token counters (myndr fork extension on LLMResponse).
+	// Providers report them on a single chunk of the stream, so the last
+	// non-zero value is retained rather than overwritten unconditionally.
+	cachedInputTokens   int64
+	cacheCreationTokens int64
+
 	currentThoughtSignature []byte
 
 	sequence             []*genai.Part
@@ -84,6 +90,12 @@ func (s *streamingResponseAggregator) aggregateResponse(llmResponse *model.LLMRe
 	}
 	if llmResponse.CitationMetadata != nil {
 		s.citationMetadata = llmResponse.CitationMetadata
+	}
+	if llmResponse.CachedInputTokens != 0 {
+		s.cachedInputTokens = llmResponse.CachedInputTokens
+	}
+	if llmResponse.CacheCreationTokens != 0 {
+		s.cacheCreationTokens = llmResponse.CacheCreationTokens
 	}
 
 	if llmResponse.FinishReason != "" {
@@ -317,12 +329,14 @@ func (s *streamingResponseAggregator) Close() *model.LLMResponse {
 				Parts: s.sequence,
 				Role:  genai.RoleModel,
 			},
-			UsageMetadata:     s.usageMetadata,
-			GroundingMetadata: s.groundingMetadata,
-			CitationMetadata:  s.citationMetadata,
-			ErrorCode:         errorCode,
-			ErrorMessage:      errorMessage,
-			FinishReason:      s.finishReason,
+			UsageMetadata:       s.usageMetadata,
+			CachedInputTokens:   s.cachedInputTokens,
+			CacheCreationTokens: s.cacheCreationTokens,
+			GroundingMetadata:   s.groundingMetadata,
+			CitationMetadata:    s.citationMetadata,
+			ErrorCode:           errorCode,
+			ErrorMessage:        errorMessage,
+			FinishReason:        s.finishReason,
 		}
 	}
 	return nil

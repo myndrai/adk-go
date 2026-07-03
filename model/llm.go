@@ -40,10 +40,19 @@ type LLMRequest struct {
 // LLMResponse is the raw LLM response.
 // It provides the first candidate response from the model if available.
 type LLMResponse struct {
-	Content             *genai.Content
-	CitationMetadata    *genai.CitationMetadata
-	GroundingMetadata   *genai.GroundingMetadata
-	UsageMetadata       *genai.GenerateContentResponseUsageMetadata
+	Content           *genai.Content
+	CitationMetadata  *genai.CitationMetadata
+	GroundingMetadata *genai.GroundingMetadata
+	UsageMetadata     *genai.GenerateContentResponseUsageMetadata
+	// CachedInputTokens reports input tokens served from the provider's
+	// prompt cache (Anthropic cache_read_input_tokens). Zero on providers
+	// that do not surface a cache-read counter.
+	CachedInputTokens int64
+	// CacheCreationTokens reports input tokens written to the provider's
+	// prompt cache during this request (Anthropic
+	// cache_creation_input_tokens). Zero on providers that do not surface
+	// a cache-write counter.
+	CacheCreationTokens int64
 	CustomMetadata      map[string]any
 	LogprobsResult      *genai.LogprobsResult
 	InputTranscription  *genai.Transcription

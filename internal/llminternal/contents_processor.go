@@ -26,6 +26,7 @@ import (
 	"google.golang.org/genai"
 
 	"google.golang.org/adk/v2/agent"
+	"google.golang.org/adk/v2/internal/compaction"
 	"google.golang.org/adk/v2/internal/utils"
 	"google.golang.org/adk/v2/model"
 	"google.golang.org/adk/v2/session"
@@ -54,6 +55,9 @@ func ContentsRequestProcessor(ctx agent.InvocationContext, req *model.LLMRequest
 				events = append(events, e)
 			}
 		}
+		// Fold compacted older events into a single synthesized turn
+		// (no-op when no compaction events exist). Myndr fork extension.
+		events = compaction.Fold(events)
 		isSingleTurn := state.Mode == ModeSingleTurn
 		contents, err := fn(ctx.Agent().Name(), ctx.Branch(), ctx.IsolationScope(), events, isSingleTurn, ctx.UserContent())
 		if err != nil {
